@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+test/
 .DS_Store
 *.safetensors
 *.pt
@@ -11,3 +12,6 @@ build/
 .vscode/
 *.swp
 *.swo
+trace.json
+*.qdrep
+*.nsys-rep
