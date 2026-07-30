@@ -16,7 +16,7 @@ from random import randint, seed
 
 import torch
 
-from qwen3 import Qwen3Config, Qwen3ForCausalLM
+from qwen3 import Qwen3Config, Qwen3ForCausalLM, KVCachePool
 from qwen3 import load_weights_from_safetensors
 from generate import generate
 
@@ -168,6 +168,24 @@ def main():
         print(f"  Model VRAM: {vram_model - vram_baseline:.2f} GB "
               f"(total: {vram_model:.2f} GB)")
 
+    # --- KV Cache 共享池 ---
+    block_size = 16
+    max_seq_tokens = args.max_input_len + args.max_output_len
+    num_blocks = (max_seq_tokens + block_size - 1) // block_size
+    num_blocks = max(num_blocks, 128)
+    kv_pool = KVCachePool(
+        num_blocks=num_blocks,
+        num_layers=config.num_hidden_layers,
+        block_size=block_size,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    pool_mem_mb = (kv_pool.k_buffer.numel() * kv_pool.k_buffer.element_size()
+                   + kv_pool.v_buffer.numel() * kv_pool.v_buffer.element_size()) / 1024**2
+    print(f"  KV pool: {num_blocks} blocks x {block_size} tokens, {pool_mem_mb:.1f} MB")
+
     # ============================================================
     # 4. 预热
     # ============================================================
@@ -184,6 +202,7 @@ def main():
             max_new_tokens=warm_output_len,
             temperature=args.temperature,
             eos_token_id=-1,  # 不触发 EOS
+            kv_cache_pool=kv_pool,
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -226,6 +245,7 @@ def main():
             max_new_tokens=target_output_len,
             temperature=args.temperature,
             eos_token_id=-1,  # 忽略 EOS，保证生成长度精确可控
+            kv_cache_pool=kv_pool,
         )
 
         if device.type == "cuda":
@@ -368,6 +388,7 @@ def main():
                 max_new_tokens=prof_output_len,
                 temperature=args.temperature,
                 eos_token_id=-1,
+                kv_cache_pool=kv_pool,
             )
 
         # --- 算子耗时排名 ---

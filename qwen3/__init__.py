@@ -9,6 +9,7 @@ qwen3 — 从零手写 Qwen3 模型推理
 from .config import Qwen3Config
 from .model import Qwen3ForCausalLM, Qwen3Model
 from .kv_cache import NaiveKVCache
+from .PagedKVcache import KVCachePool, PagedKVCache
 from .weights import load_weights_from_hf, load_weights_from_safetensors
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "Qwen3ForCausalLM",
     "Qwen3Model",
     "NaiveKVCache",
+    "KVCachePool",
+    "PagedKVCache",
     "load_weights_from_hf",
     "load_weights_from_safetensors",
 ]
