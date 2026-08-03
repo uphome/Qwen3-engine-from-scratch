@@ -20,6 +20,8 @@ import torch.nn.functional as F
 
 from .norm import RMSNorm
 from .rope import apply_rotary_pos_emb
+from .PagedKVcache import PagedKVCache
+from .paged_attention import paged_attention
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -73,7 +75,13 @@ class Qwen3Attention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # KV cache: 先存新的（只存新 token 的 K,V），再拼旧的做 attention
+        # KV cache: 分页则走 PagedAttention（逐物理页计算，不重建连续 K/V）
+        if isinstance(kv_cache, PagedKVCache):
+            attn_output = paged_attention(q, k, v, kv_cache, layer_idx,
+                                          attention_mask, self.scaling)
+            return self.o_proj(attn_output)
+
+        # 朴素路径：先存新的（只存新 token 的 K,V），再拼旧的做 attention
         if kv_cache is not None:
             k_old, v_old = kv_cache.get_kv(layer_idx)
             kv_cache.update(layer_idx, k, v)    # 只存 k_new, v_new（S_new 个 token）
