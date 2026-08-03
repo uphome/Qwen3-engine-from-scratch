@@ -22,6 +22,7 @@ from .norm import RMSNorm
 from .rope import apply_rotary_pos_emb
 from .PagedKVcache import PagedKVCache
 from .paged_attention import paged_attention
+from .kernels.paged_attention import triton_paged_attention_decode
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -77,8 +78,14 @@ class Qwen3Attention(nn.Module):
 
         # KV cache: 分页则走 PagedAttention（逐物理页计算，不重建连续 K/V）
         if isinstance(kv_cache, PagedKVCache):
-            attn_output = paged_attention(q, k, v, kv_cache, layer_idx,
-                                          attention_mask, self.scaling)
+            if S == 1 and kv_cache.seq_len > 0 and q.is_cuda:
+                # decode：Triton kernel（bf16 GPU 专用，内部负责 update）
+                attn_output = triton_paged_attention_decode(
+                    q, k, v, kv_cache, layer_idx, self.scaling)
+            else:
+                # prefill（或 CPU/非 bf16 兜底）：PyTorch 逐页实现
+                attn_output = paged_attention(q, k, v, kv_cache, layer_idx,
+                                              attention_mask, self.scaling)
             return self.o_proj(attn_output)
 
         # 朴素路径：先存新的（只存新 token 的 K,V），再拼旧的做 attention
