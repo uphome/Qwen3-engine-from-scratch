@@ -84,7 +84,7 @@ def paged_attention(q, k_new, v_new, kv_cache, layer_idx, attention_mask, scalin
     for j, phys_id in enumerate(block_table):  #第一个是 逻辑ID  第二个是物理ID
         # 该物理页当前层的 K/V: [Hk, page_size, D]，GQA 扩头 → [1, H, page_size, D]
         k_page = repeat_kv(pool.k_buffer[phys_id, layer_idx].unsqueeze(0), groups)
-        v_page = repeat_kv(pool.v_buffer[phys_id, layer_idx].unsqueeze(0), groups)
+        v_page = repeat_kv(pool.v_buffer[phys_id, layer_idx].unsqueeze(0), groups).float()
 
         # 部分分数 s^(p) = Q @ K_pageᵀ * scale ∈ R^B（一页的局部得分）
         s = (torch.matmul(q, k_page.transpose(-2, -1)) * scaling).float()
@@ -107,3 +107,58 @@ def paged_attention(q, k_new, v_new, kv_cache, layer_idx, attention_mask, scalin
     # ---- 4. 归一化 + 还原为 (B, S, hidden) ----
     attn_output = (acc / l).to(q.dtype)                   # [B, H, S, D]
     return attn_output.transpose(1, 2).reshape(B, S, -1)
+
+
+# ============================================================
+# 工业化优化清单（学习笔记，非本文件实现内容）
+# ============================================================
+#
+# 本文件是"正确版"教学实现；工业部署（vLLM / SGLang 等）在此之上
+# 还有一系列优化，按层次记录如下：
+#
+# ── 1. Kernel 计算层面（单次 attention 更快）─────────────────
+#   - exp2 代替 exp：分数先乘 1/ln2，softmax 用 exp2（GPU 硬件指令）
+#   - 两遍式 softmax：第一遍算各页局部 (max, sum)，第二遍算最终权重，
+#     比逐页 online rescale 少累积误差与指令（vLLM v1 kernel 结构）
+#   - K/V 打包：[K|V] 拼一个张量，一次 gather 取到两者，访存减半
+#   - fp8 KV cache：KV 存 fp8，计算时反量化；decode 受带宽限制，KV 内存减半
+#   - out_dtype 控制：tl.dot(..., out_dtype=...) 减少 fp32→bf16 转换
+#   - head_dim 特化：64/128/256 各编一份专用 kernel，tile 形状调优
+#   - block_size 特化：满块时跳过 tl.where（mask 指令省掉）
+#
+# ── 2. GPU 硬件特性（吃满 SM）───────────────────────────────
+#   - cp.async 异步拷贝（Ampere+）：load 下一块 K/V 时算当前块，
+#     访存与计算重叠
+#   - TMA（Hopper）：硬件搬运大块数据到共享内存，释放寄存器
+#   - Warp specialization（Hopper/Blackwell）：producer warp 只搬数据、
+#     consumer warp 只算，互不抢寄存器
+#   - split-K：页维度切碎并行，小 batch 长上下文时换并行度
+#   - num_warps / num_stages 自动调优：Triton autotune 启动时扫配置选最快
+#
+# ── 3. 调度层面（吞吐核心，比 kernel 更重要）─────────────────
+#   - Continuous batching：请求动态进出 batch，不等整批结束
+#   - Chunked prefill：长 prompt 切 chunk 与 decode 混批，
+#     避免单个长 prefill 卡死所有 decode
+#   - Prefix caching：相同 prompt 前缀的 KV 块哈希复用，省 prefill
+#   - Copy-on-write 块共享：beam search / 并行采样共享前缀块，分裂才拷贝
+#   - 换出 (swap)：KV 块在 GPU↔CPU 间搬移，超卖显存
+#   - Watermark 水位管理：池子留余量防 OOM，请求到达先检查能否满足
+#
+#   → 以上调度优化都基于本项目的同一套抽象：共享池 + 块表 + 请求级句柄
+#
+# ── 4. 模型架构层面（从源头省 KV）───────────────────────────
+#   - GQA（本项目已用）：KV 头减为 1/G，KV cache 内存同比例降
+#   - MLA（DeepSeek）：KV 压成低秩 latent，KV 内存再降一个量级
+#   - Sliding window：只保留最近 N 个 token 的 KV，长上下文内存 O(N)
+#
+# ── 5. 安全与正确性（容易被忽略）────────────────────────────
+#   - 新块清零（zero-initialized KV cache）：torch.empty 的块里残留
+#     上一个请求的 K/V，虽然 get_kv 只读 seq_len 内，工业部署仍需
+#     防跨请求数据泄漏（vLLM 提供 --zero-initialized-kv-cache）
+#     ⚠ 本实现当前未清零，教学无碍，上线前需处理
+#
+# 结论：本项目已具备工业实现的骨架（共享池 + 块表 + 分页计算），
+# 缺的是 kernel 细节（exp2/两遍 softmax/fp8）与调度层
+# （continuous batching / chunked prefill），下一步推荐方向：
+# continuous batching——把串行请求循环变为多请求并发，池子与块表无需改动。
+# ============================================================

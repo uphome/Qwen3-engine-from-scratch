@@ -14,6 +14,8 @@ QK-Norm (Qwen3 特有):
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,12 +80,17 @@ class Qwen3Attention(nn.Module):
 
         # KV cache: 分页则走 PagedAttention（逐物理页计算，不重建连续 K/V）
         if isinstance(kv_cache, PagedKVCache):
-            if S == 1 and kv_cache.seq_len > 0 and q.is_cuda:
+            # 环境变量 QWEN3_PAGED_ATTN=pytorch 可强制走 PyTorch 版（消融对比用）
+            use_triton = (
+                S == 1 and kv_cache.seq_len > 0 and q.is_cuda
+                and os.environ.get("QWEN3_PAGED_ATTN", "triton") == "triton"
+            )
+            if use_triton:
                 # decode：Triton kernel（bf16 GPU 专用，内部负责 update）
                 attn_output = triton_paged_attention_decode(
                     q, k, v, kv_cache, layer_idx, self.scaling)
             else:
-                # prefill（或 CPU/非 bf16 兜底）：PyTorch 逐页实现
+                # prefill（或 CPU/非 bf16/强制 PyTorch）：逐页实现
                 attn_output = paged_attention(q, k, v, kv_cache, layer_idx,
                                               attention_mask, self.scaling)
             return self.o_proj(attn_output)

@@ -20,7 +20,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 先转 float32 做归一化（避免 bfloat16 精度问题），再转回原 dtype
+        # 先转 float32 做归一化（避免 bfloat16 精度问题），最后再转回原 dtype
         x_float = x.float()
         rms = torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x_float * rms).to(x.dtype) * self.weight
+        return ((x_float * rms) * self.weight).to(x.dtype)

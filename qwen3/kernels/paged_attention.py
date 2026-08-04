@@ -39,6 +39,7 @@ def paged_attn_decode_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     num_kv_groups: tl.constexpr,
+    BLOCK_G: tl.constexpr,       # q tile 行数（tl.dot 要求 >= 16，G 不足补齐）
     scaling: tl.float32,
 ):
     pid = tl.program_id(0)
@@ -48,11 +49,11 @@ def paged_attn_decode_kernel(
     L = tl.load(seq_len_ptr + b).to(tl.int32)
     num_pages = tl.maximum(0, (L + block_size - 1) // block_size)
 
-    offs_g = tl.arange(0, num_kv_groups)
+    offs_g = tl.arange(0, BLOCK_G)        # 行 tile 固定 16 行，多余行（>= num_kv_groups）算完丢弃
     offs_d = tl.arange(0, head_dim)
     offs_p = tl.arange(0, block_size)
 
-    # GQA: 一次加载本 KV 头服务的 num_kv_groups 个 query
+    # GQA: 一次加载本 KV 头服务的 num_kv_groups 个 query（补齐到 BLOCK_G 行）
     q = tl.load(
         q_ptr
         + b * stride_q_b
@@ -62,9 +63,9 @@ def paged_attn_decode_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    m = tl.full((num_kv_groups,), float("-inf"), dtype=tl.float32)
-    d_acc = tl.zeros((num_kv_groups,), dtype=tl.float32)
-    o = tl.zeros((num_kv_groups, head_dim), dtype=tl.float32)
+    m = tl.full((BLOCK_G,), float("-inf"), dtype=tl.float32)
+    d_acc = tl.zeros((BLOCK_G,), dtype=tl.float32)
+    o = tl.zeros((BLOCK_G, head_dim), dtype=tl.float32)
 
     for pg in range(num_pages):
         page_id = tl.load(
@@ -131,6 +132,7 @@ def paged_attention_decode_triton(q, k_buffer, v_buffer, block_table, seq_len, b
     assert v_buffer.shape == k_buffer.shape
     num_kv_groups = num_heads // num_kv_heads
     scaling = 1.0 / math.sqrt(head_dim)
+    BLOCK_G = 16   # tl.dot 要求所有维度 >= 16；GQA group 通常 2/4，补齐到 16
 
     out = torch.empty_like(q)
     grid = (B * num_kv_heads,)
@@ -142,7 +144,7 @@ def paged_attention_decode_triton(q, k_buffer, v_buffer, block_table, seq_len, b
         v_buffer.stride(0), v_buffer.stride(1), v_buffer.stride(2), v_buffer.stride(3),
         block_table.stride(0), block_table.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
-        num_heads, num_kv_heads, head_dim, block_size, num_kv_groups, scaling,
+        num_heads, num_kv_heads, head_dim, block_size, num_kv_groups, BLOCK_G, scaling,
         num_warps=2,
         num_stages=2,
     )

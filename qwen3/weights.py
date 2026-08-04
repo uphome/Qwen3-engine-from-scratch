@@ -69,4 +69,5 @@ def load_weights_from_safetensors(model: nn.Module, model_path: str, device: tor
         print(f" Warning: Missing keys when loading weights: {result.missing_keys}")
     if result.unexpected_keys:
         print(f" Warning: Unexpected keys when loading weights: {result.unexpected_keys}")
-    model.to(device=device)
+    # 加载后显式转 dtype + 设备（load_state_dict 的 copy_ 保持参数原 dtype，不会自动转）
+    model.to(device=device, dtype=dtype)
