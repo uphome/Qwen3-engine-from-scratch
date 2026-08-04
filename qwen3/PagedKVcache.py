@@ -86,25 +86,37 @@ class PagedKVCache:
         """将新 token 的 K, V 写入页中（向量化，一次写入所有 token）
 
         k_new, v_new: (B, num_kv_heads, S_new, head_dim)
+
+        核心思想：把"每个 token 写到哪个物理页的哪个偏移"从 Python 循环
+        改成张量批量计算（advanced indexing），一次 kernel 写完全部 token。
+        旧版逐 token 循环在 prefill（S_new 大）时是 28 层 × S_new 次
+        Python 循环 + kernel 启动，向量化后循环次数降为 1。
         """
         _, _, S_new, _ = k_new.shape
         write_pos = self.seq_len
         end_pos = write_pos + S_new
 
-        # 确保页表覆盖到 end_pos（页不够则从池申请）
+        # ---- 1. 先一次性补齐页表（而不是写 token 过程中发现不够再补）----
+        #     需要 ceil(end_pos / block_size) 个逻辑页；不够则从池申请
         need_blocks = (end_pos + self._pool.block_size - 1) // self._pool.block_size
         while len(self.block_table) < need_blocks:
             self._allocate_block()
 
-        # 向量化定位：每个 token 的逻辑位置 → (物理页, 页内偏移)
-        # 用 advanced indexing 一次性写入，替代逐 token Python 循环
-        pos = torch.arange(write_pos, end_pos, device=k_new.device)
-        block_idx = pos // self._pool.block_size
-        offset = pos % self._pool.block_size
+        # ---- 2. 向量化定位：每个 token 的逻辑位置 → (物理页, 页内偏移) ----
+        pos = torch.arange(write_pos, end_pos, device=k_new.device)  # 所有逻辑位置 [0, 1, ..., S_new-1]
+        block_idx = pos // self._pool.block_size                     # 属于第几个逻辑页（每 block_size 个相同）
+        offset = pos % self._pool.block_size                         # 页内偏移（0..block_size-1 循环）
+        # 块表查表：逻辑页 → 物理页 ID（同一逻辑页的所有 token 映射到同一物理页）
         phys_ids = torch.tensor(self.block_table, device=k_new.device)[block_idx]
 
-        # k_new[0]: (Hkv, S_new, D) → permute → (S_new, Hkv, D)
-        # 与 pool.k_buffer[phys_ids, layer, :, offset] 的 (S_new, Hkv, D) 对齐
+        # ---- 3. advanced indexing 一次写入全部 token ----
+        # 左边: pool.k_buffer[phys_ids, layer_idx, :, offset]
+        #   phys_ids / offset 都是 (S_new,) 索引张量 → PyTorch 逐元素配对:
+        #   结果[i, h, j] = pool.k_buffer[phys_ids[i], layer_idx, h, offset[i], j]
+        #   结果形状 (S_new, num_kv_heads, head_dim)，即第 i 个 token 的 K 写进
+        #   它对应的 (物理页, 页内偏移)，一次 kernel 完成
+        # 右边: k_new[0] 是 (num_kv_heads, S_new, head_dim)，permute(1,0,2)
+        #   调换成 (S_new, num_kv_heads, head_dim) 与左边形状对齐
         self._pool.k_buffer[phys_ids, layer_idx, :, offset] = k_new[0].permute(1, 0, 2)
         self._pool.v_buffer[phys_ids, layer_idx, :, offset] = v_new[0].permute(1, 0, 2)
 

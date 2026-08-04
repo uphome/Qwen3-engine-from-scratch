@@ -48,7 +48,6 @@ python bench.py --model /path/to/Qwen3-0.6B --profile --profile-output trace.jso
 
 ## 致谢
 
-- [wyann22/aios](https://github.com/wyann22/aios) — 本项目的核心结构受此教程启发
 - [Qwen3](https://github.com/QwenLM/Qwen3) — Qwen3 模型架构与权重
 - [mini-sglang](https://github.com/sgl-project/sglang) — bench.py 参考 mini-sglang 的 benchmark 设计
 
