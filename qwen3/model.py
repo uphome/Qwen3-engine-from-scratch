@@ -26,42 +26,92 @@ class Qwen3Model(nn.Module):
 
     def forward(self, input_ids: torch.Tensor,
                 kv_cache=None) -> torch.Tensor:
+        """
+        input_ids: (batch, seq_len)
+        kv_cache: 单个 PagedKVCache（单请求）| list[PagedKVCache]（批）
+                  | None。传入则使用 KV cache（prefill 存，decode 读+存）
+        returns: logits (batch, seq_len, vocab_size)
+
+        批量设计（continuous batching 基础）：
+          - 核心思想：单请求 = 长度为 1 的批，一套代码覆盖两种场景
+          - 批内每个请求的 seq_len 独立（缓存长度、可见范围、位置都不共享）
+          - 三个关键点：
+            ① position_ids 逐请求取自己的 start_pos（RoPE 位置不能共享）
+            ② mask 逐请求限制可见列（防止请求间 KV 泄漏）
+            ③ advance_seq_len 逐请求推进（各自维护进度）
+        """
         B, S = input_ids.shape
+
+        # ---- 统一 kv_cache 为 list ----
+        # 单请求（B=1）与批量（B>1）共用同一套批逻辑，单请求只是批的特例。
+        # 后面所有逻辑都按"批"处理，批大小为 1 时自然退化为单请求行为。
+        # assert 是安全网：input_ids 有几个请求，就必须有几个缓存句柄。
+        if kv_cache is None:
+            caches = None
+        elif isinstance(kv_cache, (list, tuple)):
+            caches = list(kv_cache)
+            assert len(caches) == B, f"kv_caches 数量 {len(caches)} 必须等于 batch {B}"
+        else:
+            caches = [kv_cache]
 
         # Token embedding: 每个 token ID -> 向量
         hidden_states = self.embed_tokens(input_ids)
 
-        # 位置 ID
-        if kv_cache is not None and kv_cache.seq_len > 0:
-            # Decode 模式：新 token 的位置 = 已缓存的长度
-            start_pos = kv_cache.seq_len
-            position_ids = torch.arange(start_pos, start_pos + 1, device=input_ids.device).unsqueeze(0)
-        else:
-            # Prefill 模式：位置从 0 开始
-            position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
+        if caches is not None and caches[0].seq_len > 0:
+            # ---- Decode 模式 ----
+            # ① position_ids 必须逐请求独立：
+            #    请求 A 缓存了 100 token → 新 token 位置 = 100
+            #    请求 B 缓存了 50  token → 新 token 位置 = 50
+            #    RoPE 的位置决定绝对位置信息，若共享 start_pos，
+            #    请求 B 的 token 会被当成位置 100，相对位置全错。
+            #    单请求时代是标量 start_pos，批量时代改为逐行张量。
+            start_pos = torch.tensor([c.seq_len for c in caches],
+                                     device=input_ids.device)
+            position_ids = start_pos.unsqueeze(1).expand(B, S) #decode模式 S=1
 
-        # 提前计算 RoPE cos/sin
+            # ---- ② mask (B, 1, S, max_kv)：批安全的灵魂 ----
+            # 问题：attention 的 K/V 张量在 batch 内必须矩形 (B, H, max_kv, D)，
+            #       但各请求 kv_len 不同，短请求要"补齐"到 max_kv。
+            #       补齐的列是别的请求的 KV——绝不能让它看到！
+            # 解法：初始全 0（可见），逐请求把"自己 kv_len 之外"的列置 -inf，
+            #       softmax 权重为 0 → 请求间逻辑隔离。
+            #       例: 请求 A kv=110 → 全可见；请求 B kv=60 → 后 50 列 -inf。
+            # 注意：decode 走 Triton kernel 时不看 mask（kernel 每请求单独跑，
+            #       只读自己的块表），此 mask 是 PyTorch 兜底路径（CPU/prefill）用的。
+            max_kv = max(c.seq_len + S for c in caches)
+            causal_mask = torch.zeros(B, 1, S, max_kv, device=input_ids.device,
+                                      dtype=hidden_states.dtype)
+            for i, c in enumerate(caches):
+                kv_len_i = c.seq_len + S
+                if kv_len_i < max_kv:
+                    causal_mask[i, :, :, kv_len_i:] = float("-inf")
+        else:
+            # ---- Prefill 模式 ----
+            # 位置从 0 开始，所有请求共享（批内同时 prefill 时 S 相同）。
+            # 标准因果掩码: torch.triu 作用于最后两维，对 (B, S, S) 自动逐批处理。
+            # 注意：本简化版假设批内同一步要么全 prefill 要么全 decode；
+            #       真正的混批（有的 prefill 有的 decode）需要 chunked prefill。
+            position_ids = torch.arange(S, device=input_ids.device) \
+                .unsqueeze(0).expand(B, -1)
+            causal_mask = torch.full((B, S, S), float("-inf"),
+                                     device=input_ids.device, dtype=hidden_states.dtype)
+            causal_mask = torch.triu(causal_mask, diagonal=1).unsqueeze(1)
+
+        # 提前计算 RoPE cos/sin（position_ids 已是逐请求独立的）
         position_embeddings = self.rotary_emb(position_ids)
 
-        # 注意力掩码
-        if kv_cache is not None and kv_cache.seq_len > 0:
-            # Decode 模式：Q 只有 1 个位置，可以看到所有缓存的 K + 自己的 K
-            kv_len = kv_cache.seq_len + S
-            causal_mask = torch.zeros(1, 1, S, kv_len, device=input_ids.device, dtype=hidden_states.dtype)
-        else:
-            # Prefill 模式：标准因果掩码
-            causal_mask = torch.full((S, S), float("-inf"), device=input_ids.device, dtype=hidden_states.dtype)
-            causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
-
-        # 逐层前向传播
+        # 逐层前向传播：caches（list）整包传给每层，
+        # 层内根据 layer_idx 取每个请求自己的第 i 层缓存
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, causal_mask, position_embeddings,
-                                  kv_cache=kv_cache, layer_idx=i)
+                                  kv_cache=caches, layer_idx=i)
 
-        # 更新缓存计数（prefill 加 S，decode 加 1）
-        if kv_cache is not None:
-            kv_cache.advance_seq_len(S)
+        # ---- ③ 逐请求推进缓存进度 ----
+        # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），
+        # 否则下次 decode 的位置计算就全错了。
+        if caches is not None:
+            for c in caches:
+                c.advance_seq_len(S)
 
         # 最终归一化
         return self.norm(hidden_states)
