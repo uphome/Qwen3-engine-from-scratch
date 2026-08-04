@@ -22,6 +22,31 @@
 
 † 旧口径（无 synchronize）：Triton 路径接近真实（CPU 提交快），PyTorch 逐页路径低估 ~4 倍。
 
+## 公平口径重跑（真实墙钟，GPU 2 空闲，seed 42）
+
+> 各历史 commit 检出独立 worktree，仅移植 synchronize 计时修复（推理代码原样），
+> 同命令同参数重跑。v0.4 代码 ≈ v0.5（仅计时差异），不重跑。
+
+| 版本 | commit | Decode (ms/tok) | Prefill (ms) | Throughput (tok/s) | VRAM (GB) | 备注 |
+|------|--------|-----------------|-------------|--------------------|-----------|------|
+| v0.1 | 4a20a44 | **24.3** | 60.0 | **40.72** | 3.90 | Naive cat，fp32 权重 |
+| v0.2 | 9bfbba3 | 34.6 | 562.0 | 27.13 | 3.89 | 分页存储 + 重建连续 K/V |
+| v0.3 | 3ec469b | 34.6 | 864.6 | 27.16 | 2.06 | Triton decode + 旧逐页 prefill |
+| v0.5 | 当前 | 33.7 | **35.0** | 29.58 | 2.06 | Triton decode + 标准 prefill |
+
+### 关键发现
+
+1. **单请求串行场景下 v0.1（naive cat）最快**（24.3ms vs 33.7ms）：
+   分页/Triton 在 B=1 时反而慢 ~10ms——Triton grid = B×Hkv = 8 个 program，
+   A100 108 个 SM 利用率 <8%；naive 的大 matmul 吃满 cuBLAS。
+2. **分页/Triton 的价值在并发**：开销靠 continuous batching 摊薄，
+   单请求串行是它们的劣势场景——这是做 continuous batching 的动机。
+3. **v0.2 认知修正**：它走的是"分页存储 + get_kv 重建连续 K/V + 标准 attention"
+   （每步 torch.cat 全量重建，+10ms vs v0.1），不是逐页循环；
+   逐页循环（~150ms）是 a19ad64 引入、v0.4 prefill 优化时移除的。
+4. **prefill 优化收益最大**：v0.3 旧逐页 864.6ms → v0.5 标准 attention 35.0ms（-96%）。
+5. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），速度无贡献（v0.3 vs v0.2 decode 相同）。
+
 ## v0.1 详细 — 纯 PyTorch 手写, NaiveKVCache (torch.cat)
 
 ### 总体
