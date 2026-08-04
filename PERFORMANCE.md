@@ -6,17 +6,32 @@
 > 计时口径: **真实墙钟**（perf_counter + torch.cuda.synchronize），端到端用户感知延迟
 > 历史教训: 早期数据用 CPU 提交时间（无 synchronize），PyTorch 逐页路径被低估 ~4 倍，已废弃重跑
 
+## 版本命名（语义化版本号）
+
+主版本号表示**技术代际**，次版本号表示同代内的改进：
+
+```
+v0.1  NaiveKVCache 基线（无分页）
+v0.2  PagedKVCache（存储层分页：共享池 + 块表，计算仍标准 attention）
+v1.0  PagedAttention（计算层分页：Triton decode kernel + dtype 修复）
+v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正，当前版本）
+```
+
+- **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
+- **v1.x = PagedAttention 时代**（计算也分页，主版本跨入 1.0）
+- v1.1 由历史提交 03d1007（prefill 优化）+ 86411cd（计时修正）合并而来，两者代码等价
+
 ## 汇总对比（公平口径，真实墙钟）
 
 | 版本 | commit | 改动 | Throughput (tok/s) | Decode (ms/tok) | Prefill (ms) | Peak VRAM (GB) |
 |------|--------|------|--------------------|-----------------|-------------|-----------------|
 | v0.1 | 4a20a44 | 纯 PyTorch, NaiveKVCache (torch.cat) | **40.72** | **24.3** | 60.0 | 3.90 |
 | v0.2 | 9bfbba3 | PagedKVCache + 重建连续 K/V | 27.13 | 34.6 | 562.0 | 3.89 |
-| v0.3 | 3ec469b | Triton decode kernel + dtype 修复 | 27.16 | 34.6 | 864.6 | 2.06 |
-| v0.5 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
+| v1.0 | 3ec469b | Triton decode kernel + dtype 修复 | 27.16 | 34.6 | 864.6 | 2.06 |
+| v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
 
-> v0.4 代码 ≈ v0.5（仅计时差异），数据并入 v0.5。v0.1-v0.3 为历史 commit 检出
-> worktree、仅移植 synchronize 计时修复后同环境重跑。
+> v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
+> 同环境重跑；v1.1 为当前版本实测。
 
 ### 关键发现
 
@@ -27,11 +42,11 @@
    单请求串行是它们的劣势场景——这是做 continuous batching 的动机。
 3. **v0.2 走的是"分页存储 + get_kv 重建连续 K/V + 标准 attention"**
    （每步 torch.cat 全量重建，+10ms vs v0.1），不是逐页循环；
-   逐页循环（~150ms）是 a19ad64 引入、v0.4 prefill 优化时移除的。
-4. **prefill 优化收益最大**：v0.3 旧逐页 864.6ms → v0.5 标准 attention 35.0ms（-96%）。
-5. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），速度无贡献（v0.3 vs v0.2 decode 相同）。
+   逐页循环（~150ms）是 v1.0 引入、v1.1 prefill 优化时移除的。
+4. **prefill 优化收益最大**：v1.0 旧逐页 864.6ms → v1.1 标准 attention 35.0ms（-96%）。
+5. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），速度无贡献（v1.0 vs v0.2 decode 相同）。
 
-### 为什么 v0.2/v0.3 的 prefill 这么慢
+### 为什么 v0.2/v1.0 的 prefill 这么慢
 
 **v0.2（562ms）— 卡在 `update` 的逐 token Python 循环**
 
@@ -49,9 +64,9 @@ for t in range(S_new):                    # 平均 491 个 token 循环 491 次
 Python 解释器开销（~1µs）+ 一次 kernel 启动（~5-10µs，每次只写 1 个 token 的 K/V），
 累积 → 562ms。注意此时 attention 本身是标准实现（连续 K/V），并不慢。
 
-**v0.3（864.6ms）— 双重浪费：写进分页 + 逐页读回**
+**v1.0（864.6ms）— 双重浪费：写进分页 + 逐页读回**
 
-v0.3 的 prefill 走 `paged_attention()`，比 v0.2 多了一整趟无效往返：
+v1.0 的 prefill 走 `paged_attention()`，比 v0.2 多了一整趟无效往返：
 
 ```python
 kv_cache.update(layer_idx, k_new, v_new)   # ① 逐 token 循环写入分页（~500ms）
@@ -66,24 +81,24 @@ for j, phys_id in enumerate(block_table):  # ② 又从分页逐页读回来！
 ≈ **5000+ 次小 kernel**，且每页都是 batch=1 的小矩阵（tensor core 利用率 <1%）。
 这解释了 864.6 vs 562 的 +300ms 差距。
 
-**最讽刺的是**：prefill 的 K/V 本来就是连续张量，v0.3 却先把它拆散写进分页、
+**最讽刺的是**：prefill 的 K/V 本来就是连续张量，v1.0 却先把它拆散写进分页、
 再逐页读回来重建——纯白折腾（"写页→逐页读回"的无效往返）。
 
-**v0.5（35ms）— 两个修复合击**
+**v1.1（35ms）— 两个修复合击**
 
-| 阶段 | v0.2 | v0.3 | v0.5 |
+| 阶段 | v0.2 | v1.0 | v1.1 |
 |---|---|---|---|
 | 写入分页 | 逐 token 循环（~500ms） | 逐 token 循环（~500ms） | **向量化 1 次写入**（advanced indexing） |
 | 算 attention | 标准（连续 K/V，快） | 逐页读回（~300ms） | **标准（连续 K/V，快）** |
 | **合计** | **562ms** | **864.6ms** | **35ms** |
 
-- `update` 向量化（v0.4）→ 打掉 ① 的逐 token 循环（13,748 次 → 1 次）
-- prefill 改 `_standard_attention`（v0.4）→ 打掉 ② 的逐页读回（根本不做分页计算）
+- `update` 向量化（v1.1）→ 打掉 ① 的逐 token 循环（13,748 次 → 1 次）
+- prefill 改 `_standard_attention`（v1.1）→ 打掉 ② 的逐页读回（根本不做分页计算）
 - 35ms 只剩 28 层逐层调度的固定成本，不再随 prompt 长度线性增长
 
 ---
 
-## v0.5 详细 — 当前版本（Triton decode + 标准 prefill）
+## v1.1 详细 — 当前版本（Triton decode + 标准 prefill）
 
 ### 总体
 
@@ -155,7 +170,7 @@ attention forward
 - bf16 的收益是 VRAM 减半（3.89 → 2.06 GB），属带宽优化而非速度优化
 - Triton 路径 CPU 开销趋零，两种计时口径一致；PyTorch 逐页路径 CPU 提交与真实墙钟差 ~4 倍
 
-### Prefill 优化（v0.4，并入本版）
+### Prefill 优化（v1.1 两大改动）
 
 1. **prefill 不再走逐页 PyTorch 实现**：K/V 本来就是连续张量，直接标准 attention
    （`_standard_attention`，vLLM 同款做法），顺带写入分页供 decode 使用
@@ -175,7 +190,7 @@ prefill 时间 ≈ 常数（~43ms 固定开销主导：28 层逐层调度 + kern
 
 ---
 
-## v0.3 详细 — Triton decode kernel + dtype 修复（重跑）
+## v1.0 详细 — PagedAttention：Triton decode kernel + dtype 修复（重跑）
 
 ### 总体
 
