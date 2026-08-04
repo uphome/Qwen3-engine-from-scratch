@@ -31,6 +31,56 @@
 4. **prefill 优化收益最大**：v0.3 旧逐页 864.6ms → v0.5 标准 attention 35.0ms（-96%）。
 5. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），速度无贡献（v0.3 vs v0.2 decode 相同）。
 
+### 为什么 v0.2/v0.3 的 prefill 这么慢
+
+**v0.2（562ms）— 卡在 `update` 的逐 token Python 循环**
+
+```python
+# v0.2 的 update（9bfbba3）：
+for t in range(S_new):                    # 平均 491 个 token 循环 491 次
+    pos = write_pos + t
+    block_idx = pos // block_size         # 每次 Python 除法/取模
+    while len(self.block_table) <= block_idx:   # 每次都要检查页表
+        self._allocate_block()
+    pool.k_buffer[phys_id, layer, :, offset] = k_new[0, :, t, :]   # 1 次小 kernel 写 1 个 token
+```
+
+开销 = 28 层 × 491 token = **13,748 次 Python 循环**，每次循环包含
+Python 解释器开销（~1µs）+ 一次 kernel 启动（~5-10µs，每次只写 1 个 token 的 K/V），
+累积 → 562ms。注意此时 attention 本身是标准实现（连续 K/V），并不慢。
+
+**v0.3（864.6ms）— 双重浪费：写进分页 + 逐页读回**
+
+v0.3 的 prefill 走 `paged_attention()`，比 v0.2 多了一整趟无效往返：
+
+```python
+kv_cache.update(layer_idx, k_new, v_new)   # ① 逐 token 循环写入分页（~500ms）
+...
+for j, phys_id in enumerate(block_table):  # ② 又从分页逐页读回来！
+    k_page = repeat_kv(pool.k_buffer[phys_id, layer_idx]...)   # repeat_kv → kernel
+    s = matmul(q, k_page)                  # matmul → kernel
+    exp / max / sum / matmul(p, v_page)    # 每页 ~6 次 kernel 启动
+```
+
+② 的额外开销：平均 ~31 页 × 28 层 = 868 次页循环，每页 6 次 kernel 启动
+≈ **5000+ 次小 kernel**，且每页都是 batch=1 的小矩阵（tensor core 利用率 <1%）。
+这解释了 864.6 vs 562 的 +300ms 差距。
+
+**最讽刺的是**：prefill 的 K/V 本来就是连续张量，v0.3 却先把它拆散写进分页、
+再逐页读回来重建——纯白折腾（"写页→逐页读回"的无效往返）。
+
+**v0.5（35ms）— 两个修复合击**
+
+| 阶段 | v0.2 | v0.3 | v0.5 |
+|---|---|---|---|
+| 写入分页 | 逐 token 循环（~500ms） | 逐 token 循环（~500ms） | **向量化 1 次写入**（advanced indexing） |
+| 算 attention | 标准（连续 K/V，快） | 逐页读回（~300ms） | **标准（连续 K/V，快）** |
+| **合计** | **562ms** | **864.6ms** | **35ms** |
+
+- `update` 向量化（v0.4）→ 打掉 ① 的逐 token 循环（13,748 次 → 1 次）
+- prefill 改 `_standard_attention`（v0.4）→ 打掉 ② 的逐页读回（根本不做分页计算）
+- 35ms 只剩 28 层逐层调度的固定成本，不再随 prompt 长度线性增长
+
 ---
 
 ## v0.5 详细 — 当前版本（Triton decode + 标准 prefill）
