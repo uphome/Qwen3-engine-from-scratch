@@ -16,8 +16,10 @@
 | v0.1 | 2026-07-28 | 纯 PyTorch, NaiveKVCache (torch.cat) | 24.35 | 26.7 | 79.5 | 3.90 |
 | v0.2 | 2026-07-30 | PagedKVCache (共享池 + 块表, 单请求) | 25.26 | 36.6* | 602.1 | 3.89 |
 | v0.3 | 2026-08-04 | Triton decode kernel + 修复 weights/norm dtype | 28.89 | 31.7 | 797.3 | 2.06 |
+| v0.4 | 2026-08-04 | prefill 标准 attention + update 向量化 | 27.49 | 36.1† | **50.0** | 2.06 |
 
 * v0.2 的 Decode 为 CUDA Event 口径（纯 GPU 时间）；墙钟口径 ~155 ms/tok。
+† v0.4 跑时 GPU 有外部负载，decode 数值偏高（消融 A/B/C 三组同步偏移 ~8%，代码无退化）。
 
 ## v0.1 详细 — 纯 PyTorch 手写, NaiveKVCache (torch.cat)
 
@@ -154,3 +156,40 @@
 - v0.2 的 36.6 ms/tok 是 CUDA Event 口径（纯 GPU 时间），Python 循环的 CPU 开销被隐藏；
   真实墙钟 ~155 ms/tok。Triton 路径 CPU 开销趋零，两种口径一致（≈32 ms）
 - prefill 仍走 PyTorch 路径且变慢（602→797 ms），疑因 `v_page.float()` 每页转换 + bf16 小算子开销
+
+## v0.4 详细 — prefill 优化（标准 attention + 向量化 update）
+
+### 改动
+
+1. **prefill 不再走逐页 PyTorch 实现**：K/V 本来就是连续张量，直接标准 attention
+   （`_standard_attention`，vLLM 同款做法），顺带写入分页供 decode 使用，
+   省去"写页 → 逐页读回重建"的无效往返
+2. **`PagedKVCache.update` 向量化**：advanced indexing 一次性写入 S 个 token，
+   替代逐 token Python 循环
+
+### 效果（bench_prefill.py 专项，bf16，GPU 2）
+
+| prefill 长度 | 耗时 | 对比 v0.3 旧路径 |
+|------|------|------|
+| 128 | 42.1 ms | - |
+| 512 | 42.9 ms | - |
+| 1024 | 43.6 ms | - |
+
+prefill 时间 ≈ 常数（~43ms 固定开销主导：28 层逐层调度 + kernel 启动），
+不再随序列长度线性增长。bench 全量：Prefill 797 → 50 ms（-94%），
+占总时间 7.7% → 0.5%。
+
+### 完整 benchmark（v0.4）
+
+| 指标 | 数值 |
+|------|------|
+| Total GPU time | 700.9 s |
+| Throughput | 27.49 tok/s |
+| Prefill (mean) | 50.0 ms |
+| Decode (mean) | 36.1 ms/tok（含外部负载，见汇总注释） |
+| Peak VRAM | 2.06 GB |
+
+### 备注
+
+- prefill 优化后为常数开销，长 prompt 场景收益最大
+- 下一步方向：continuous batching（多请求共享池并发调度）

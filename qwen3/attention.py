@@ -89,8 +89,13 @@ class Qwen3Attention(nn.Module):
                 # decode：Triton kernel（bf16 GPU 专用，内部负责 update）
                 attn_output = triton_paged_attention_decode(
                     q, k, v, kv_cache, layer_idx, self.scaling)
+            elif S > 1:
+                # prefill：K/V 本来就是连续张量，直接标准 attention（vLLM 同款做法），
+                # 顺带写入分页供 decode 使用；不做"写页→逐页读回"的白折腾
+                kv_cache.update(layer_idx, k, v)
+                attn_output = self._standard_attention(q, k, v, attention_mask)
             else:
-                # prefill（或 CPU/非 bf16/强制 PyTorch）：逐页实现
+                # decode 兜底（CPU/非 bf16/强制 PyTorch）：逐页实现
                 attn_output = paged_attention(q, k, v, kv_cache, layer_idx,
                                               attention_mask, self.scaling)
             return self.o_proj(attn_output)
@@ -104,6 +109,13 @@ class Qwen3Attention(nn.Module):
                 k = torch.cat([k_old, k], dim=2)
                 v = torch.cat([v_old, v], dim=2)
 
+        attn_output = self._standard_attention(q, k, v, attention_mask)
+
+        # reshape 回 (B, S, hidden) 并投影输出
+        return self.o_proj(attn_output)
+
+    def _standard_attention(self, q, k, v, attention_mask):
+        """连续 K/V 的标准 attention: softmax(Q @ K^T / sqrt(d)) @ V"""
         # GQA: 将 KV 头复制以匹配 Q 头数量
         k = repeat_kv(k, self.num_kv_groups)
         v = repeat_kv(v, self.num_kv_groups)
@@ -114,6 +126,6 @@ class Qwen3Attention(nn.Module):
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         attn_output = torch.matmul(attn_weights, v)
 
-        # reshape 回 (B, S, hidden) 并投影输出
-        attn_output = attn_output.transpose(1, 2).reshape(B, S, -1)
-        return self.o_proj(attn_output)
+        # reshape 回 (B, S, hidden)
+        B, S, _ = q.shape[0], q.shape[2], None
+        return attn_output.transpose(1, 2).reshape(B, S, -1)

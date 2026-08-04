@@ -83,24 +83,30 @@ class PagedKVCache:
         return k.unsqueeze(0), v.unsqueeze(0)   # [1, H, seq_len, D]
 
     def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor):
-        """将新 token 的 K, V 写入页中
+        """将新 token 的 K, V 写入页中（向量化，一次写入所有 token）
 
         k_new, v_new: (B, num_kv_heads, S_new, head_dim)
         """
         _, _, S_new, _ = k_new.shape
         write_pos = self.seq_len
+        end_pos = write_pos + S_new
 
-        for t in range(S_new):
-            pos = write_pos + t
-            block_idx = pos // self._pool.block_size
-            offset = pos % self._pool.block_size
+        # 确保页表覆盖到 end_pos（页不够则从池申请）
+        need_blocks = (end_pos + self._pool.block_size - 1) // self._pool.block_size
+        while len(self.block_table) < need_blocks:
+            self._allocate_block()
 
-            while len(self.block_table) <= block_idx:
-                self._allocate_block()
+        # 向量化定位：每个 token 的逻辑位置 → (物理页, 页内偏移)
+        # 用 advanced indexing 一次性写入，替代逐 token Python 循环
+        pos = torch.arange(write_pos, end_pos, device=k_new.device)
+        block_idx = pos // self._pool.block_size
+        offset = pos % self._pool.block_size
+        phys_ids = torch.tensor(self.block_table, device=k_new.device)[block_idx]
 
-            phys_id = self.block_table[block_idx]
-            self._pool.k_buffer[phys_id, layer_idx, :, offset] = k_new[0, :, t, :]
-            self._pool.v_buffer[phys_id, layer_idx, :, offset] = v_new[0, :, t, :]
+        # k_new[0]: (Hkv, S_new, D) → permute → (S_new, Hkv, D)
+        # 与 pool.k_buffer[phys_ids, layer, :, offset] 的 (S_new, Hkv, D) 对齐
+        self._pool.k_buffer[phys_ids, layer_idx, :, offset] = k_new[0].permute(1, 0, 2)
+        self._pool.v_buffer[phys_ids, layer_idx, :, offset] = v_new[0].permute(1, 0, 2)
 
     def advance_seq_len(self, n: int = 1):
         self.seq_len += n
