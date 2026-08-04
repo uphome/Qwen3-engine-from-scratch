@@ -6,20 +6,21 @@
 >
 > ⚠ 重要更正：v0.1/v0.2 因 weights.py 漏传 dtype，权重实际为 float32（伪 bf16）；
 >   显存 3.01 GB（=0.75B×4B）可证。v0.3 修复后为真 bf16（1.50 GB）。
->   v0.2 的 Decode 36.6 ms/tok 是 CUDA Event 量的纯 GPU 时间，真实墙钟 ~155 ms/tok
->   （Python 逐页循环的 CPU 开销被 Event 隐藏），消融实验见 v0.3 备注。
+>   计时口径：v0.1-v0.4 的 step_times 未加 torch.cuda.synchronize()，
+>   测的是 CPU 提交时间（PyTorch 逐页路径低估 ~4 倍）；v0.5 起统一为真实墙钟。
+>   v0.2 的 Decode 36.6 实际墙钟 ~150 ms/tok。
 
 ## 汇总对比
 
-| 版本 | 日期 | 改动 | Throughput (tok/s) | Decode (ms/tok) | Prefill (ms) | Peak VRAM (GB) |
-|------|------|------|--------------------|-----------------|-------------|-----------------|
-| v0.1 | 2026-07-28 | 纯 PyTorch, NaiveKVCache (torch.cat) | 24.35 | 26.7 | 79.5 | 3.90 |
-| v0.2 | 2026-07-30 | PagedKVCache (共享池 + 块表, 单请求) | 25.26 | 36.6* | 602.1 | 3.89 |
-| v0.3 | 2026-08-04 | Triton decode kernel + 修复 weights/norm dtype | 28.89 | 31.7 | 797.3 | 2.06 |
-| v0.4 | 2026-08-04 | prefill 标准 attention + update 向量化 | 27.49 | 36.1† | **50.0** | 2.06 |
+| 版本 | 日期 | 改动 | Throughput (tok/s) | Decode (ms/tok) | Prefill (ms) | Peak VRAM (GB) | 口径 |
+|------|------|------|--------------------|-----------------|-------------|-----------------|------|
+| v0.1 | 2026-07-28 | 纯 PyTorch, NaiveKVCache (torch.cat) | 24.35 | 26.7† | 79.5† | 3.90 | CUDA Event |
+| v0.2 | 2026-07-30 | PagedKVCache (共享池 + 块表, 单请求) | 25.26 | 36.6† | 602.1† | 3.89 | CPU 提交时间 |
+| v0.3 | 2026-08-04 | Triton decode kernel + 修复 weights/norm dtype | 28.89 | 31.7† | 797.3† | 2.06 | CPU 提交时间 |
+| v0.4 | 2026-08-04 | prefill 标准 attention + update 向量化 | 27.49 | 36.1† | 50.0† | 2.06 | CPU 提交时间 |
+| v0.5 | 2026-08-04 | 统一墙钟口径 (synchronize) | 29.58 | **33.7** | **35.0** | 2.06 | 真实墙钟 |
 
-* v0.2 的 Decode 为 CUDA Event 口径（纯 GPU 时间）；墙钟口径 ~155 ms/tok。
-† v0.4 跑时 GPU 有外部负载，decode 数值偏高（消融 A/B/C 三组同步偏移 ~8%，代码无退化）。
+† 旧口径（无 synchronize）：Triton 路径接近真实（CPU 提交快），PyTorch 逐页路径低估 ~4 倍。
 
 ## v0.1 详细 — 纯 PyTorch 手写, NaiveKVCache (torch.cat)
 

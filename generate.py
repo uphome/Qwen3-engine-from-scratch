@@ -74,6 +74,11 @@ def generate(
                 # Decode: 只送入最后一个 token，其余 K,V 从 cache 读
                 logits = model(generated[:, -1:], kv_cache=kv_cache)
 
+            # CUDA 异步执行：必须同步才能测到真实墙钟（等 GPU 算完）。
+            # 不同步的话 perf_counter 只测到"CPU 提交 kernel 的时间"，
+            # 对 Python 逐页路径会低估数倍（GPU 还在后台排队执行）。
+            if input_ids.is_cuda:
+                torch.cuda.synchronize()
             dt = time.perf_counter() - t0
             stats["step_times"].append(dt)
 

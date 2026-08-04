@@ -12,6 +12,7 @@ write by Claude code +deepseek4
 
 import argparse
 import statistics
+import time
 from random import randint, seed
 
 import torch
@@ -234,11 +235,8 @@ def main():
         input_ids = input_ids.to(device)
         input_len = input_ids.shape[1]
 
-        # GPU 精确计时: 用 CUDA Event 包裹 generate()
-        if device.type == "cuda":
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
+        # 端到端墙钟计时: perf_counter + synchronize（和 generate 内部 step_times 同口径）
+        t_seq_start = time.perf_counter()
 
         output_ids, stats = generate(
             model, input_ids,
@@ -249,11 +247,8 @@ def main():
         )
 
         if device.type == "cuda":
-            end_event.record()
             torch.cuda.synchronize()
-            total_gpu_ms = start_event.elapsed_time(end_event)
-        else:
-            total_gpu_ms = sum(stats["step_times"]) * 1000  # fallback: CPU 时间
+        total_gpu_ms = (time.perf_counter() - t_seq_start) * 1000
 
         # 提取指标
         n_generated = output_ids.shape[1] - input_len
