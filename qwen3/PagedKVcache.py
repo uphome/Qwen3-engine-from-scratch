@@ -25,9 +25,16 @@ class KVCachePool:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
-        self.k_buffer = torch.empty(num_blocks, num_layers, num_kv_heads,
+
+        # KVCachePool 用 torch.empty 初始化，未写入槽位是垃圾数据（可能含 NaN/±inf）
+        # → decode 时 QK^T 溢出 + mask 的 -inf 相加产生 NaN → 输出全 0。
+        # 现象是"多跑几次随机失败"。
+        # 零初始化：torch.empty 的未写入槽位是垃圾数据（可能含 NaN/±inf），
+        # 即使被 mask 挡住也可能通过 +inf + (-inf) = NaN 污染计算。
+        # 工业实现（vLLM --zero-initialized-kv-cache）同样清零池。
+        self.k_buffer = torch.zeros(num_blocks, num_layers, num_kv_heads,
                                      block_size, head_dim, device=device, dtype=dtype)
-        self.v_buffer = torch.empty(num_blocks, num_layers, num_kv_heads,
+        self.v_buffer = torch.zeros(num_blocks, num_layers, num_kv_heads,
                                      block_size, head_dim, device=device, dtype=dtype)
 
         self.free_block_ids = list(range(num_blocks))
