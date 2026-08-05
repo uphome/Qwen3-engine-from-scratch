@@ -83,12 +83,25 @@ def paged_attention(q, k_new, v_new, kv_cache, layer_idx, attention_mask, scalin
     # ---- 3. 逐物理页：部分分数 → online-softmax 合并 ----
     for j, phys_id in enumerate(block_table):  #第一个是 逻辑ID  第二个是物理ID
         # 该物理页当前层的 K/V: [Hk, page_size, D]，GQA 扩头 → [1, H, page_size, D]
-        k_page = repeat_kv(pool.k_buffer[phys_id, layer_idx].unsqueeze(0), groups)
-        v_page = repeat_kv(pool.v_buffer[phys_id, layer_idx].unsqueeze(0), groups).float()
+        k_page = pool.k_buffer[phys_id, layer_idx].unsqueeze(0)
+        v_page = pool.v_buffer[phys_id, layer_idx].unsqueeze(0)
+
+        # 本页有效槽位数（最后一页可能没写满）；未写入的槽位是 torch.empty 的
+        # 垃圾数据——若不处理，垃圾 K 可能使 QK^T 溢出为 ±inf，与 mask 的 -inf
+        # 相加产生 NaN。先按槽位置零（Triton kernel 用 tl.load(other=0.0) 同理）
+        valid = min(page_size, kv_total - j * page_size)
+        slot_mask = (torch.arange(page_size, device=q.device) < valid) \
+            .view(1, 1, page_size, 1)
+        k_page = k_page * slot_mask
+        v_page = v_page * slot_mask
+
+        k_page = repeat_kv(k_page, groups).float()
+        v_page = repeat_kv(v_page, groups).float()
 
         # 部分分数 s^(p) = Q @ K_pageᵀ * scale ∈ R^B（一页的局部得分）
-        s = (torch.matmul(q, k_page.transpose(-2, -1)) * scaling).float()
-        s = s + mask_full[:, :, :, j * page_size:(j + 1) * page_size]
+        # q 需要显式转 float32（bf16 下与 float 的 k_page matmul 会类型报错）
+        s = torch.matmul(q.float(), k_page.transpose(-2, -1)) * scaling
+        s = s + mask_full[:, :, :, j * page_size:(j + 1) * page_size].float()
 
         # online-softmax 合并（对照推导 ①②③④）：
         # ① 新全局最大值 m' = max(m, 本页最大值 m_p)
