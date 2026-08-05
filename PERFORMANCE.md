@@ -2,30 +2,36 @@
 
 > 测试环境: NVIDIA A100-PCIE-40GB / CUDA 11.8 / PyTorch 2.2.2 / bfloat16
 > 测试模型: Qwen3-0.6B (751M params, 28 layers, hidden=1024, Q heads=16, KV heads=8)
-> 测试命令: `python bench.py --model /data/hjt1/Qwen3-0.6B --num-seqs 64 --warmup 3 --min-input-len 32 --max-input-len 1024 --min-output-len 64 --max-output-len 512 --seed 42`
 > 计时口径: **真实墙钟**（perf_counter + torch.cuda.synchronize），端到端用户感知延迟
 > 历史教训: 早期数据用 CPU 提交时间（无 synchronize），PyTorch 逐页路径被低估 ~4 倍，已废弃重跑
 
-## 版本命名（语义化版本号）
+---
 
-主版本号表示**技术代际**，次版本号表示同代内的改进：
+## 1. 版本命名（语义化版本号）
+
+主版本号表示**技术代际**：
 
 ```
 v0.1  NaiveKVCache 基线（无分页）
 v0.2  PagedKVCache（存储层分页：共享池 + 块表，计算仍标准 attention）
 v1.0  PagedAttention（计算层分页：Triton decode kernel + dtype 修复）
-v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正，当前版本）
+v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正）
+v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4，当前开发中）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
 - **v1.x = PagedAttention 时代**（计算也分页，主版本跨入 1.0）
-- v1.1 由历史提交 03d1007（prefill 优化）+ 86411cd（计时修正）合并而来，两者代码等价
+- **v2.x = Continuous Batching 时代**（多请求并发调度，吞吐量级提升）
 
-## 汇总对比（公平口径，真实墙钟）
+---
 
-| 版本 | commit | 改动 | Throughput (tok/s) | Decode (ms/tok) | Prefill (ms) | Peak VRAM (GB) |
-|------|--------|------|--------------------|-----------------|-------------|-----------------|
-| v0.1 | 4a20a44 | 纯 PyTorch, NaiveKVCache (torch.cat) | **40.72** | **24.3** | 60.0 | 3.90 |
+## 2. 汇总对比
+
+### 2.1 单请求串行（bench.py，64 序列，GPU 空闲）
+
+| 版本 | commit | 改动 | Throughput (tok/s) | Decode (ms/tok) | Prefill (ms) | VRAM (GB) |
+|------|--------|------|--------------------|-----------------|-------------|-----------|
+| v0.1 | 4a20a44 | NaiveKVCache (torch.cat) | **40.72** | **24.3** | 60.0 | 3.90 |
 | v0.2 | 9bfbba3 | PagedKVCache + 重建连续 K/V | 27.13 | 34.6 | 562.0 | 3.89 |
 | v1.0 | 3ec469b | Triton decode kernel + dtype 修复 | 27.16 | 34.6 | 864.6 | 2.06 |
 | v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
@@ -33,20 +39,221 @@ v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正，�
 > v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
 > 同环境重跑；v1.1 为当前版本实测。
 
-### 关键发现
+### 2.2 连续批处理（bench_batched.py，16 序列，GPU 空闲）
 
-1. **单请求串行场景下 v0.1（naive cat）最快**（24.3ms vs 33.7ms）：
-   分页/Triton 在 B=1 时反而慢 ~10ms——Triton grid = B×Hkv = 8 个 program，
-   A100 108 个 SM 利用率 <8%；naive 的大 matmul 吃满 cuBLAS。
-2. **分页/Triton 的价值在并发**：开销靠 continuous batching 摊薄，
-   单请求串行是它们的劣势场景——这是做 continuous batching 的动机。
-3. **v0.2 走的是"分页存储 + get_kv 重建连续 K/V + 标准 attention"**
-   （每步 torch.cat 全量重建，+10ms vs v0.1），不是逐页循环；
-   逐页循环（~150ms）是 v1.0 引入、v1.1 prefill 优化时移除的。
-4. **prefill 优化收益最大**：v1.0 旧逐页 864.6ms → v1.1 标准 attention 35.0ms（-96%）。
-5. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），速度无贡献（v1.0 vs v0.2 decode 相同）。
+| Mode | Batch | Throughput | Decode | Lat p50 | vs serial |
+|---|---|---|---|---|---|
+| serial | 1 | 29.8 tok/s | 32.6 ms/tok | 6.42s | 1.00x |
+| batched | 1 | 29.1 | 33.5 | 6.67s | 0.98x |
+| batched | 2 | 46.3 | 20.8 | 4.41s | **1.55x** |
+| batched | 3 | 62.5 | 15.3 | 3.62s | **2.10x** |
+| batched | 4 | 74.8 | 12.8 | 3.27s | **2.51x** |
 
-### 为什么 v0.2/v1.0 的 prefill 这么慢
+### 2.3 关键发现
+
+1. **单请求串行下 v0.1（naive cat）最快**（24.3ms vs 33.7ms）：分页/Triton 在 B=1 时
+   反而慢 ~10ms——Triton grid = B×Hkv = 8 个 program，SM 利用率 <8%；naive 大 matmul 吃满 cuBLAS。
+2. **分页/Triton 的价值在并发**：开销靠 continuous batching 摊薄——这是做并发调度的动机。
+3. **prefill 优化收益最大**：v1.0 逐页 864.6ms → v1.1 标准 attention 35.0ms（-96%）。
+4. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），对速度无贡献（v1.0 vs v0.2 decode 相同）。
+5. **当前瓶颈在工程流水线**：GPU 纯算 29ms/步 vs 墙钟 91ms/步（利用率仅 32%），
+   详见 v2.0 的瓶颈分析。
+
+---
+
+## 3. 版本详细（按时间正序）
+
+### 3.1 v0.1 — NaiveKVCache（torch.cat）
+
+| 指标 | 数值 |
+|------|------|
+| 总序列数 | 64 |
+| 总输入 tokens | 31,458 |
+| 总输出 tokens | 19,228 |
+| 总 GPU 时间 | 472.2 s |
+
+| | mean | min | max | p50 | p95 | p99 |
+|------|------|-----|------|-----|------|------|
+| Input len | 491 | 38 | 1012 | 415 | 971 | 998 |
+| Output len | 300 | 80 | 509 | 297 | 500 | 507 |
+| Prefill (ms) | 60.0 | 23.9 | 124.0 | 47.6 | 111.1 | 118.7 |
+| Decode (ms/tok) | 24.3 | 23.4 | 25.7 | 24.2 | 25.3 | 25.5 |
+| Total (ms) | 7,377.6 | 1,983.2 | 12,567.5 | 7,377.3 | 12,192.6 | 12,441.1 |
+
+| Prefill | Decode |
+|---------|--------|
+| 3.84s (0.8%) | 468.33s (99.2%) |
+
+| 模型加载后 | 推理峰值 | 增量 |
+|-----------|---------|------|
+| 3.01 GB | 3.90 GB | +0.88 GB |
+
+### 3.2 v0.2 — PagedKVCache + 重建连续 K/V
+
+| 指标 | 数值 |
+|------|------|
+| 总序列数 | 64 |
+| 总输入 tokens | 31,458 |
+| 总输出 tokens | 19,228 |
+| 总 GPU 时间 | 708.6 s |
+| KV pool | 128 blocks × 16 tokens, 224 MB |
+
+| | mean | min | max | p50 | p95 | p99 |
+|------|------|-----|------|-----|------|------|
+| Input len | 491 | 38 | 1012 | 415 | 971 | 998 |
+| Output len | 300 | 80 | 509 | 297 | 500 | 507 |
+| Prefill (ms) | 562.0 | 64.6 | 1342.8 | 473.8 | 1082.4 | 1207.5 |
+| Decode (ms/tok) | 34.6 | 26.6 | 43.0 | 34.5 | 40.9 | 42.7 |
+| Total (ms) | 11,072.0 | 2,549.6 | 22,589.4 | 10,544.5 | 19,723.1 | 21,650.5 |
+
+| Prefill | Decode |
+|---------|--------|
+| 35.97s (5.1%) | 672.64s (94.9%) |
+
+| 模型加载后 | 推理峰值 | 增量 |
+|-----------|---------|------|
+| 3.01 GB | 3.89 GB | +0.88 GB |
+
+备注：
+- decode = `get_kv` 每步 torch.cat 全量重建连续 K/V + 标准 attention（+10ms vs v0.1）
+- prefill = 逐 token Python 循环写入分页（562ms，原因见附录 A）
+
+### 3.3 v1.0 — PagedAttention：Triton decode kernel + dtype 修复
+
+| 指标 | 数值 |
+|------|------|
+| 总序列数 | 64 |
+| 总输入 tokens | 30,095 |
+| 总输出 tokens | 19,271 |
+| 总 GPU 时间 | 709.6 s |
+
+| | mean | min | max | p50 | p95 | p99 |
+|------|------|-----|------|-----|------|------|
+| Input len | 470 | 38 | 1012 | 403 | 970 | 998 |
+| Output len | 301 | 76 | 509 | 297 | 500 | 507 |
+| Prefill (ms) | 864.6 | 93.7 | 2301.2 | 738.5 | 1832.8 | 2217.4 |
+| Decode (ms/tok) | 34.6 | 30.9 | 50.4 | 31.9 | 47.8 | 49.6 |
+| Total (ms) | 11,087.1 | 2,589.2 | 24,427.1 | 11,481.2 | 16,992.2 | 20,162.5 |
+
+| Prefill | Decode |
+|---------|--------|
+| 55.33s (7.8%) | 654.24s (92.2%) |
+
+| 模型加载后 | 推理峰值 | 增量 |
+|-----------|---------|------|
+| 1.50 GB | 2.06 GB | +0.56 GB |
+
+本轮修复（dtype bugs）：
+- `weights.py`: `model.to(device)` 漏 dtype → 权重一直 float32（伪 bf16）；改为 `model.to(device, dtype)`
+- `norm.py`: RMSNorm 输出被 float32 weight 升回 float32；改为整体计算后统一 `.to(x.dtype)`
+- `paged_attention.py`: `v_page` 升 fp32 统一计算精度
+- Triton kernel: `tl.dot` 要求维度 ≥ 16，GQA group 仅 2/4，q tile 补齐 BLOCK_G=16
+
+### 3.4 v1.1 — 优化版（当前单请求版本）
+
+| 指标 | 数值 |
+|------|------|
+| 总序列数 | 64 |
+| 总输入 tokens | 30,095 |
+| 总输出 tokens | 19,271 |
+| 总 GPU 时间 | 651.5 s |
+| KV pool | 128 blocks × 16 tokens, 224 MB |
+
+| | mean | min | max | p50 | p95 | p99 |
+|------|------|-----|------|-----|------|------|
+| Input len | 470 | 38 | 1012 | 403 | 970 | 998 |
+| Output len | 301 | 76 | 509 | 297 | 500 | 507 |
+| Prefill (ms) | 35.0 | 30.0 | 51.0 | 33.3 | 48.0 | 50.7 |
+| Decode (ms/tok) | 33.7 | 31.3 | 35.7 | 33.9 | 34.9 | 35.4 |
+| Total (ms) | 10,179.2 | 2,528.5 | 18,088.5 | 10,089.0 | 16,759.8 | 17,846.9 |
+
+| Prefill | Decode |
+|---------|--------|
+| 2.24s (0.3%) | 649.23s (99.7%) |
+
+| 模型加载后 | 推理峰值 | 增量 |
+|-----------|---------|------|
+| 1.50 GB | 2.06 GB | +0.56 GB |
+
+架构（三段式 attention 路径）：
+
+```
+attention forward
+├── PagedKVCache 分支
+│   ├── decode (S=1, CUDA, bf16)  → Triton kernel（qwen3/kernels/paged_attention.py）
+│   ├── prefill (S>1)              → 标准 attention + 写入分页
+│   └── decode 兜底 (CPU/fp32)     → PyTorch 逐页（paged_attention.py）
+└── NaiveKVCache 分支              → cat 拼历史 + 标准 attention
+```
+
+本轮优化（prefill 两大改动）：
+1. **prefill 不再走逐页 PyTorch 实现**：K/V 本来就是连续张量，直接标准 attention
+   （`_standard_attention`，vLLM 同款做法），顺带写入分页供 decode 使用
+2. **`PagedKVCache.update` 向量化**：advanced indexing 一次性写入 S 个 token，
+   替代逐 token Python 循环
+
+效果（bench_prefill.py 专项）：prefill 时间 ≈ 常数（128/512/1024 tokens 均 ~43ms），
+不再随序列长度线性增长。
+
+精度验证：
+- fp32 vs bf16 贪心输出: 40/40 token 一致（dtype 修复无精度退化）
+- naive(cat) vs paged(Triton decode): 48/48 token 一致
+
+### 3.5 v2.0 — 连续批处理（当前开发中）
+
+> 引擎：Scheduler + Request + Batch（qwen3/scheduler.py 等）
+> 基准：`bench_batched.py`（16 序列，batch 1-4 扫描，GPU 2 空闲，真实墙钟）
+> 请求规格: input [32,128], output [16,64], greedy, eos 关闭
+
+#### 批扫描结果
+
+| Mode | Batch | Steps | Throughput | Decode | Lat p50 | vs serial |
+|---|---|---|---|---|---|---|
+| serial | 1 | - | 29.8 tok/s | 32.6 ms/tok | 6.42s | 1.00x |
+| batched | 1 | 8+344 | 29.1 | 33.5 | 6.67s | 0.98x |
+| batched | 2 | 7+188 | 46.3 | 20.8 | 4.41s | **1.55x** |
+| batched | 3 | 6+125 | 62.5 | 15.3 | 3.62s | **2.10x** |
+| batched | 4 | 5+95 | 74.8 | 12.8 | 3.27s | **2.51x** |
+
+连续批处理收益确认：batch=4 时吞吐 2.51x、decode 2.55x；
+batch=1 ≈ serial（0.98x），等价性验证通过。
+
+#### 瓶颈分析（batch=8 时 profile）
+
+| 指标 | 数值 | 说明 |
+|---|---|---|
+| 墙钟 | 91.3 ms/步 | 用户感知时间 |
+| GPU 纯 kernel | 29.4 ms/步 | profiler 统计，仅 **32% 利用率** |
+| GPU 空等 CPU | ~62 ms | CPU 提交瓶颈（主因） |
+| CPU 组装/收尾 | ~0.6 ms | 可忽略 |
+
+top kernel（每步）：
+- `paged_attn_decode_kernel`: 1.06ms × 28 次（真正 attention 仅 ~3.6%）
+- Memcpy HtoD: 0.96ms × 477 次（**块表 torch.tensor 拷贝**）
+- Memcpy DtoD: 1.09ms × 224 次（update 写入）
+- index_elementwise: 5.61ms × 448 次（mask 构造 + 采样索引）
+
+**结论**：瓶颈在工程流水线——每层重复的块表重建/HtoD 拷贝 + 无用 mask 构造，
+GPU 算力只用了 1/3。优化方向见 ENGINE_COMPARISON.md TODO（P0：块表缓存、
+跳过 mask、CUDA Graph）。
+
+#### 硬件上限估算
+
+```
+0.6B bf16 权重 = 1.5 GB；A100 带宽 ≈ 2 TB/s
+decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步
+当前 91ms/步 vs 硬件极限 0.75ms → 软件层瓶颈（非硬件），优化空间 ~120 倍
+```
+
+#### 本轮修复（调度器 bug）
+
+- `scheduler.py` prefill 补位超编：`min(batch_size, waiting)` 未减 running 已有
+  人数 → running 可超 batch_size → decode 切片 `running[:n]` 饿死队尾；
+  改为 `min(batch_size - len(running), waiting)`，demo 验证补位只取剩余空位
+
+---
+
+## 附录 A：为什么 v0.2/v1.0 的 prefill 这么慢
 
 **v0.2（562ms）— 卡在 `update` 的逐 token Python 循环**
 
@@ -92,70 +299,9 @@ for j, phys_id in enumerate(block_table):  # ② 又从分页逐页读回来！
 | 算 attention | 标准（连续 K/V，快） | 逐页读回（~300ms） | **标准（连续 K/V，快）** |
 | **合计** | **562ms** | **864.6ms** | **35ms** |
 
-- `update` 向量化（v1.1）→ 打掉 ① 的逐 token 循环（13,748 次 → 1 次）
-- prefill 改 `_standard_attention`（v1.1）→ 打掉 ② 的逐页读回（根本不做分页计算）
-- 35ms 只剩 28 层逐层调度的固定成本，不再随 prompt 长度线性增长
-
 ---
 
-## v1.1 详细 — 当前版本（Triton decode + 标准 prefill）
-
-### 总体
-
-| 指标 | 数值 |
-|------|------|
-| 总序列数 | 64 |
-| 总输入 tokens | 30,095 |
-| 总输出 tokens | 19,271 |
-| 总 GPU 时间 | 651.5 s |
-| KV pool | 128 blocks × 16 tokens, 224 MB |
-
-### 延迟分布
-
-| | mean | min | max | p50 | p95 | p99 |
-|------|------|-----|------|-----|------|------|
-| Input len | 470 | 38 | 1012 | 403 | 970 | 998 |
-| Output len | 301 | 76 | 509 | 297 | 500 | 507 |
-| Prefill (ms) | 35.0 | 30.0 | 51.0 | 33.3 | 48.0 | 50.7 |
-| Decode (ms/tok) | 33.7 | 31.3 | 35.7 | 33.9 | 34.9 | 35.4 |
-| Total (ms) | 10,179.2 | 2,528.5 | 18,088.5 | 10,089.0 | 16,759.8 | 17,846.9 |
-
-### 时间占比
-
-| Prefill | Decode |
-|---------|--------|
-| 2.24s (0.3%) | 649.23s (99.7%) |
-
-### VRAM
-
-| 模型加载后 | 推理峰值 | 增量 |
-|-----------|---------|------|
-| 1.50 GB | 2.06 GB | +0.56 GB |
-
-### 架构（三段式 attention 路径）
-
-```
-attention forward
-├── PagedKVCache 分支
-│   ├── decode (S=1, CUDA, bf16)  → Triton kernel（qwen3/kernels/paged_attention.py）
-│   ├── prefill (S>1)              → 标准 attention + 写入分页
-│   └── decode 兜底 (CPU/fp32)     → PyTorch 逐页（paged_attention.py）
-└── NaiveKVCache 分支              → cat 拼历史 + 标准 attention
-```
-
-### 本轮修复（dtype bugs）
-
-- `weights.py`: `model.to(device)` 漏 dtype → 权重一直 float32（伪 bf16）；改为 `model.to(device, dtype)`
-- `norm.py`: RMSNorm 输出被 float32 weight 升回 float32；改为整体计算后统一 `.to(x.dtype)`
-- `paged_attention.py`: `v_page` 升 fp32 统一计算精度
-- Triton kernel: `tl.dot` 要求维度 ≥ 16，GQA group 仅 2/4，q tile 补齐 BLOCK_G=16
-
-### 精度验证
-
-- fp32 vs bf16 贪心输出: 40/40 token 一致（dtype 修复无精度退化）
-- naive(cat) vs paged(Triton decode): 48/48 token 一致
-
-### 消融实验（decode 提速归因）
+## 附录 B：decode 提速归因（消融实验）
 
 同环境同 prompt，256 input + 64 decode 步，墙钟口径：
 
@@ -169,132 +315,3 @@ attention forward
 - **decode 提速 100% 归因于 Triton kernel**（B vs A 差 5.2 倍），bf16 权重本身无贡献（B vs C 甚至微负）
 - bf16 的收益是 VRAM 减半（3.89 → 2.06 GB），属带宽优化而非速度优化
 - Triton 路径 CPU 开销趋零，两种计时口径一致；PyTorch 逐页路径 CPU 提交与真实墙钟差 ~4 倍
-
-### Prefill 优化（v1.1 两大改动）
-
-1. **prefill 不再走逐页 PyTorch 实现**：K/V 本来就是连续张量，直接标准 attention
-   （`_standard_attention`，vLLM 同款做法），顺带写入分页供 decode 使用
-2. **`PagedKVCache.update` 向量化**：advanced indexing 一次性写入 S 个 token，
-   替代逐 token Python 循环
-
-效果（bench_prefill.py 专项，bf16）：
-
-| prefill 长度 | 耗时 |
-|------|------|
-| 128 | 42.1 ms |
-| 512 | 42.9 ms |
-| 1024 | 43.6 ms |
-
-prefill 时间 ≈ 常数（~43ms 固定开销主导：28 层逐层调度 + kernel 启动），
-不再随序列长度线性增长。全量对比：864.6 → 35.0 ms（-96%）。
-
----
-
-## v1.0 详细 — PagedAttention：Triton decode kernel + dtype 修复（重跑）
-
-### 总体
-
-| 指标 | 数值 |
-|------|------|
-| 总序列数 | 64 |
-| 总输入 tokens | 30,095 |
-| 总输出 tokens | 19,271 |
-| 总 GPU 时间 | 709.6 s |
-
-### 延迟分布
-
-| | mean | min | max | p50 | p95 | p99 |
-|------|------|-----|------|-----|------|------|
-| Input len | 470 | 38 | 1012 | 403 | 970 | 998 |
-| Output len | 301 | 76 | 509 | 297 | 500 | 507 |
-| Prefill (ms) | 864.6 | 93.7 | 2301.2 | 738.5 | 1832.8 | 2217.4 |
-| Decode (ms/tok) | 34.6 | 30.9 | 50.4 | 31.9 | 47.8 | 49.6 |
-| Total (ms) | 11,087.1 | 2,589.2 | 24,427.1 | 11,481.2 | 16,992.2 | 20,162.5 |
-
-### 时间占比
-
-| Prefill | Decode |
-|---------|--------|
-| 55.33s (7.8%) | 654.24s (92.2%) |
-
-### VRAM
-
-| 模型加载后 | 推理峰值 | 增量 |
-|-----------|---------|------|
-| 1.50 GB | 2.06 GB | +0.56 GB |
-
----
-
-## v0.2 详细 — PagedKVCache + 重建连续 K/V（重跑）
-
-### 总体
-
-| 指标 | 数值 |
-|------|------|
-| 总序列数 | 64 |
-| 总输入 tokens | 31,458 |
-| 总输出 tokens | 19,228 |
-| 总 GPU 时间 | 708.6 s |
-| KV pool | 128 blocks × 16 tokens, 224 MB |
-
-### 延迟分布
-
-| | mean | min | max | p50 | p95 | p99 |
-|------|------|-----|------|-----|------|------|
-| Input len | 491 | 38 | 1012 | 415 | 971 | 998 |
-| Output len | 300 | 80 | 509 | 297 | 500 | 507 |
-| Prefill (ms) | 562.0 | 64.6 | 1342.8 | 473.8 | 1082.4 | 1207.5 |
-| Decode (ms/tok) | 34.6 | 26.6 | 43.0 | 34.5 | 40.9 | 42.7 |
-| Total (ms) | 11,072.0 | 2,549.6 | 22,589.4 | 10,544.5 | 19,723.1 | 21,650.5 |
-
-### 时间占比
-
-| Prefill | Decode |
-|---------|--------|
-| 35.97s (5.1%) | 672.64s (94.9%) |
-
-### VRAM
-
-| 模型加载后 | 推理峰值 | 增量 |
-|-----------|---------|------|
-| 3.01 GB | 3.89 GB | +0.88 GB |
-
-### 备注
-
-- decode = `get_kv` 每步 torch.cat 全量重建连续 K/V + 标准 attention（+10ms vs v0.1）
-- prefill = 逐 token Python 循环写入分页（562ms）
-
----
-
-## v0.1 详细 — 纯 PyTorch 手写, NaiveKVCache (torch.cat)（重跑）
-
-### 总体
-
-| 指标 | 数值 |
-|------|------|
-| 总序列数 | 64 |
-| 总输入 tokens | 31,458 |
-| 总输出 tokens | 19,228 |
-| 总 GPU 时间 | 472.2 s |
-
-### 延迟分布
-
-| | mean | min | max | p50 | p95 | p99 |
-|------|------|-----|------|-----|------|------|
-| Input len | 491 | 38 | 1012 | 415 | 971 | 998 |
-| Output len | 300 | 80 | 509 | 297 | 500 | 507 |
-| Prefill (ms) | 60.0 | 23.9 | 124.0 | 47.6 | 111.1 | 118.7 |
-| Decode (ms/tok) | 24.3 | 23.4 | 25.7 | 24.2 | 25.3 | 25.5 |
-| Total (ms) | 7,377.6 | 1,983.2 | 12,567.5 | 7,377.3 | 12,192.6 | 12,441.1 |
-
-### 时间占比
-
-| Prefill | Decode |
-|---------|--------|
-| 3.84s (0.8%) | 468.33s (99.2%) |
-
-### VRAM
-
-| 模型加载后 | 推理峰值 | 增量 |
-|-----------|---------|------|
-| 3.01 GB | 3.90 GB | +0.88 GB |

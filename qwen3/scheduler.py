@@ -72,7 +72,12 @@ class Scheduler:
     def _schedule_prefill(self) -> Batch:
         # Phase 3: 一次 prefill 最多 batch_size 个请求（右 pad 组批，见 Batch）。
         # prefill 完立即全部进 running，下一步就能与现有请求组批 decode。
-        n = min(self.batch_size, len(self.waiting))
+        # ⚠ 补位只能装 running 剩下的空位：slots = batch_size - len(running)。
+        #   若按 min(batch_size, waiting) 取数，running 已有人时补位会超编
+        #   （如 batch_size=4, running=2, 补位取 4 → running=6），
+        #   超编后 decode 的 running[:n] 切片会饿死队尾请求。
+        slots = self.batch_size - len(self.running)
+        n = min(slots, len(self.waiting))
         reqs = [self.waiting.popleft() for _ in range(n)]
         for req in reqs:
             req.start_prefill()

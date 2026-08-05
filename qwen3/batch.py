@@ -1,12 +1,6 @@
 """
 Batch — 一个调度步内参与同一前向的请求集合
 
-Phase 1 雏形：只打包请求列表 + 模式标记，驱动循环逐个请求处理。
-Phase 2/3 将在这里组装批内张量：
-  - input_ids  (B, S)          decode 批: S=1；prefill 批: 右 pad 到 S_max
-  - position_ids (B, S)        每请求实际位置（pad 位为 0，被 mask 掉）
-  - attention_mask (B, 1, S, kv_len)  批内每请求一行
-  - block_table (B, max_pages) 收集每请求块表并右 pad
 """
 
 from __future__ import annotations

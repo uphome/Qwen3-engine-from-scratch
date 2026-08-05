@@ -40,7 +40,7 @@ def paged_attn_decode_kernel(
     block_size: tl.constexpr,
     num_kv_groups: tl.constexpr,
     BLOCK_G: tl.constexpr,       # q tile 行数（tl.dot 要求 >= 16，G 不足补齐）
-    scaling: tl.float32,
+    scaling:tl.constexpr                     # fp32 标量（triton 2.1 不支持 dtype 注解，2.2 才可写 tl.float32）
 ):
     pid = tl.program_id(0)
     b = pid // num_kv_heads       # batch 索引

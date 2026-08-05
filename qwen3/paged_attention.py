@@ -99,8 +99,9 @@ def paged_attention(q, k_new, v_new, kv_cache, layer_idx, attention_mask, scalin
         v_page = repeat_kv(v_page, groups).float()
 
         # 部分分数 s^(p) = Q @ K_pageᵀ * scale ∈ R^B（一页的局部得分）
-        s = (torch.matmul(q, k_page.transpose(-2, -1)) * scaling).float()
-        s = s + mask_full[:, :, :, j * page_size:(j + 1) * page_size]
+        # q 需要显式转 float32（bf16 下与 float 的 k_page matmul 会类型报错）
+        s = torch.matmul(q.float(), k_page.transpose(-2, -1)) * scaling
+        s = s + mask_full[:, :, :, j * page_size:(j + 1) * page_size].float()
 
         # online-softmax 合并（对照推导 ①②③④）：
         # ① 新全局最大值 m' = max(m, 本页最大值 m_p)
