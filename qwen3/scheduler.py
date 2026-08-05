@@ -70,12 +70,13 @@ class Scheduler:
         return None
 
     def _schedule_prefill(self) -> Batch:
-        # Phase 2: 一次只 prefill 1 个请求（prompt 长度不齐，批组装需要右 pad，
-        # 那是 Phase 3 的工作）。prefill 完该请求立即进 running，下一步就能
-        # 与现有请求组批 decode → running 逐步爬满 batch_size
-        req = self.waiting.popleft()
-        req.start_prefill()
-        return Batch("prefill", [req])
+        # Phase 3: 一次 prefill 最多 batch_size 个请求（右 pad 组批，见 Batch）。
+        # prefill 完立即全部进 running，下一步就能与现有请求组批 decode。
+        n = min(self.batch_size, len(self.waiting))
+        reqs = [self.waiting.popleft() for _ in range(n)]
+        for req in reqs:
+            req.start_prefill()
+        return Batch("prefill", reqs)
 
     def _schedule_decode(self) -> Batch:
         # 批内所有 running 一起 decode（最多 batch_size 个，超出留到下一步）

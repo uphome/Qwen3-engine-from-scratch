@@ -5,12 +5,13 @@
     while scheduler.has_pending():
         batch = scheduler.schedule()        # ① 调度：挑本步请求
         input_ids = batch.build_input_ids() # ② 组装：(B, S)
-        logits = model(input_ids, kv_cache=batch.build_kv_caches())
+        logits = model(input_ids, kv_cache=batch.build_kv_caches(),
+                       input_lens=batch.input_lens)
         next_tokens = sample(logits)        # ③ 采样：每请求一个 token
         scheduler.on_step_done(batch, next_tokens)  # ④ 收尾：回写/出批/归还
 
-Phase 2 现状:
-  - prefill 批: size=1（逐请求 prefill，批量前向留到 Phase 3）
+Phase 3 现状:
+  - prefill 批: 真批量 (B, S_max)，右 pad + 逐请求 position/mask
   - decode 批: 真批量 (B, 1)，一次 forward 推 B 个请求（CPU 上走
     PyTorch 逐页兜底；GPU + bf16 走 Triton kernel）
 
@@ -113,8 +114,13 @@ def main():
 
         input_ids = batch.build_input_ids()
         kv_caches = batch.build_kv_caches()
-        logits = model(input_ids, kv_cache=kv_caches)   # 一次 forward 吃整批
-        next_tokens = sample(logits[:, -1, :])          # 每请求最后一个位置
+        logits = model(input_ids, kv_cache=kv_caches,
+                       input_lens=batch.input_lens)   # 一次 forward 吃整批
+        # 每请求取自己的最后一个位置:
+        #   decode 批 S=1 → 位置 0；prefill 批右 pad → 各请求 input_len-1
+        last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
+                                device=logits.device) - 1
+        next_tokens = sample(logits[torch.arange(last_idx.shape[0]), last_idx])
 
         scheduler.on_step_done(batch, next_tokens)
         n_steps += 1

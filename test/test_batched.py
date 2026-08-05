@@ -1,11 +1,11 @@
 """
-Phase 2 验证 — 批量 decode 正确性
+Phase 3 验证 — 批量 prefill + 批量 decode 正确性
 
 对照:
   1. 调度器（批前向）跑出的输出 == 逐请求直接调 generate() 的输出（逐 token）
   2. 池的物理块分配/释放闭环（free_count 回到初始值）
   3. 状态机迁移合法
-  4. 多 seed × 多 batch_size × 变长输入
+  4. 多 seed × 多 batch_size × 变长输入（批量 prefill 必须混合长度同批）
 
 用法:
     python test/test_batched.py
@@ -57,7 +57,7 @@ def make_requests(config, n, seed=42, max_out=16):
 
 @torch.no_grad()
 def run_scheduler(model, config, requests, batch_size=2):
-    """调度主循环：prefill 逐请求 + decode 真批量，与 batched_generate.py 一致"""
+    """调度主循环：批量 prefill + 批量 decode，与 batched_generate.py 一致"""
     kv_pool = KVCachePool(
         num_blocks=64, num_layers=config.num_hidden_layers,
         block_size=16, num_kv_heads=config.num_key_value_heads,
@@ -73,8 +73,11 @@ def run_scheduler(model, config, requests, batch_size=2):
 
         input_ids = batch.build_input_ids()
         kv_caches = batch.build_kv_caches()
-        logits = model(input_ids, kv_cache=kv_caches)
-        next_tokens = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # 贪心
+        logits = model(input_ids, kv_cache=kv_caches,
+                       input_lens=batch.input_lens)
+        last_idx = torch.tensor(batch.input_lens, dtype=torch.long) - 1
+        next_tokens = logits[torch.arange(last_idx.shape[0]), last_idx] \
+            .argmax(dim=-1, keepdim=True)  # 贪心
 
         scheduler.on_step_done(batch, next_tokens)
 
@@ -110,13 +113,14 @@ def check_batch(model, config, n_reqs, batch_size, seed):
 def main():
     model, config = build_model()
 
-    # 组合: 请求数 × batch_size × seed（覆盖 prefill 补位/满批/饥饿各场景）
+    # 组合: 请求数 × batch_size × seed（覆盖 prefill 补位/满批/饥饿/一次全 prefill）
     cases = [
         (7, 2, 42),
         (9, 4, 42),
         (9, 4, 7),
         (5, 1, 0),    # batch_size=1: 等价串行
         (12, 4, 99),  # 超 batch 场景: 12 请求 4 批位
+        (9, 9, 5),    # 所有请求一次 prefill 进同一批（变长混合最狠的场景）
     ]
     for n, bs, seed in cases:
         check_batch(model, config, n, bs, seed)

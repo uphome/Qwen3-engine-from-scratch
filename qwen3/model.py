@@ -25,11 +25,13 @@ class Qwen3Model(nn.Module):
         self.rotary_emb = RotaryEmbedding(config.head_dim, config.rope_theta)
 
     def forward(self, input_ids: torch.Tensor,
-                kv_cache=None) -> torch.Tensor:
+                kv_cache=None, input_lens: list[int] | None = None) -> torch.Tensor:
         """
         input_ids: (batch, seq_len)
         kv_cache: 单个 PagedKVCache（单请求）| list[PagedKVCache]（批）
                   | None。传入则使用 KV cache（prefill 存，decode 读+存）
+        input_lens: 批内各请求的有效长度（prefill 批右 pad 后必须传入，
+                    否则模型无法知道每请求的真实边界）。decode 批不需要。
         returns: logits (batch, seq_len, vocab_size)
 
         批量设计（continuous batching 基础）：
@@ -85,17 +87,38 @@ class Qwen3Model(nn.Module):
                 kv_len_i = c.seq_len + S
                 if kv_len_i < max_kv:
                     causal_mask[i, :, :, kv_len_i:] = float("-inf")
+            lens = [S] * B
         else:
-            # ---- Prefill 模式 ----
-            # 位置从 0 开始，所有请求共享（批内同时 prefill 时 S 相同）。
-            # 标准因果掩码: torch.triu 作用于最后两维，对 (B, S, S) 自动逐批处理。
-            # 注意：本简化版假设批内同一步要么全 prefill 要么全 decode；
-            #       真正的混批（有的 prefill 有的 decode）需要 chunked prefill。
+            # ---- Prefill 批模式 ----
+            # 批内各请求 prompt 长度可能不同（外部已右 pad 到 S_max，
+            # input_lens 给出每请求真实长度）：
+            # ① position_ids 逐请求 0..len_i-1（RoPE 位置不能共享）：
+            #    pad 位随便填 0——它的输出会被采样丢弃，位置无关紧要
+            # ② mask (B, 1, S, S) 逐请求限制可见范围（批安全的灵魂）：
+            #    - 行/列 ≥ len_i 的区域（pad 或别的请求的 token）→ -inf
+            #    - 纯 pad 行整行 -inf 会让 softmax 出 NaN，所以给 pad 行
+            #      留第 0 列可见（自己请求的第一个 token，无跨请求泄漏）
+            lens = input_lens if input_lens is not None else [S] * B
+            # repeat 而非 expand：expand 是共享内存视图，逐行写 pad 会
+            # 写穿到所有行（短请求的 pad 会把长请求的位置也改成 0）
             position_ids = torch.arange(S, device=input_ids.device) \
-                .unsqueeze(0).expand(B, -1)
+                .unsqueeze(0).repeat(B, 1)
+            for i, l_i in enumerate(lens):
+                if l_i < S:
+                    position_ids[i, l_i:] = 0
+
+            row = torch.arange(S, device=input_ids.device).view(1, S, 1)       # (1, S, 1)
+            col = torch.arange(S, device=input_ids.device).view(1, 1, S)      # (1, 1, S)
+            lens_t = torch.tensor(lens, device=input_ids.device).view(B, 1, 1)  # (B, 1, 1)
+            # 有效区域: 行/列都在自己长度内 + 因果（col <= row）
+            valid = (row < lens_t) & (col < lens_t) & (col <= row)
+            # pad 行留第 0 列可见，防止整行 -inf → softmax NaN
+            pad_keep = (row >= lens_t) & (col == 0)
             causal_mask = torch.full((B, S, S), float("-inf"),
-                                     device=input_ids.device, dtype=hidden_states.dtype)
-            causal_mask = torch.triu(causal_mask, diagonal=1).unsqueeze(1)
+                                     device=input_ids.device,
+                                     dtype=hidden_states.dtype)
+            causal_mask[valid | pad_keep] = 0
+            causal_mask = causal_mask.unsqueeze(1)   # (B, 1, S, S)
 
         # 提前计算 RoPE cos/sin（position_ids 已是逐请求独立的）
         position_embeddings = self.rotary_emb(position_ids)
@@ -109,9 +132,11 @@ class Qwen3Model(nn.Module):
         # ---- ③ 逐请求推进缓存进度 ----
         # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），
         # 否则下次 decode 的位置计算就全错了。
+        # prefill 批还要按各请求自己的实际长度推进（lens），
+        # 统一用批内统一 S 会把短请求的 seq_len 多推 pad 的长度。
         if caches is not None:
-            for c in caches:
-                c.advance_seq_len(S)
+            for i, c in enumerate(caches):
+                c.advance_seq_len(lens[i])
 
         # 最终归一化
         return self.norm(hidden_states)
@@ -126,11 +151,13 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, input_ids: torch.Tensor,
-                kv_cache=None) -> torch.Tensor:
+                kv_cache=None, input_lens: list[int] | None = None) -> torch.Tensor:
         """
         input_ids: (batch, seq_len)
         kv_cache: 传入则使用 KV cache（prefill 存，decode 读+存）
+        input_lens: prefill 批各请求的有效长度（右 pad 后必须传），decode 不需要
         returns: logits (batch, seq_len, vocab_size)
         """
-        hidden_states = self.model(input_ids, kv_cache=kv_cache)
+        hidden_states = self.model(input_ids, kv_cache=kv_cache,
+                                   input_lens=input_lens)
         return self.lm_head(hidden_states)
