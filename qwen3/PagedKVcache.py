@@ -70,11 +70,21 @@ class PagedKVCache:
     def __init__(self, pool: KVCachePool):
         self._pool = pool
         self.seq_len = 0
-        self.block_table = []    # [phys_id_0, phys_id_1, ...]
+        self.block_table = []    # 逻辑块表（Python list，兼容旧接口）
+
+        # GPU 常驻块表张量：kernel / update 直接读它，避免每层
+        # torch.tensor(list) 的 HtoD 拷贝（profiler 显示每步 ~477 次）。
+        # 大小预留 total_blocks（一个请求最多可占用全部块），前 num_pages 项有效。
+        self.block_table_tensor = torch.full(
+            (pool.total_blocks,), -1, dtype=torch.int32,
+            device=pool.k_buffer.device)
+        self.num_pages = 0       # 当前已分配的页数（与 len(block_table) 同步）
 
     def _allocate_block(self):
         new = self._pool.alloc(1)
         self.block_table.append(new[0])
+        self.block_table_tensor[self.num_pages] = new[0]   # GPU 张量同步写
+        self.num_pages += 1
 
     def get_kv(self, layer_idx: int):
         """读取该层已缓存的所有 K, V"""
@@ -114,7 +124,8 @@ class PagedKVCache:
         block_idx = pos // self._pool.block_size                     # 属于第几个逻辑页（每 block_size 个相同）
         offset = pos % self._pool.block_size                         # 页内偏移（0..block_size-1 循环）
         # 块表查表：逻辑页 → 物理页 ID（同一逻辑页的所有 token 映射到同一物理页）
-        phys_ids = torch.tensor(self.block_table, device=k_new.device)[block_idx]
+        # 直接从 GPU 常驻张量切片（物理页号已经在 GPU 上，零 HtoD 拷贝）
+        phys_ids = self.block_table_tensor[:self.num_pages][block_idx]
 
         # ---- 3. advanced indexing 一次写入全部 token ----
         # 左边: pool.k_buffer[phys_ids, layer_idx, :, offset]
@@ -135,4 +146,5 @@ class PagedKVCache:
         if self.block_table:
             self._pool.free(self.block_table)
             self.block_table = []
+            self.num_pages = 0      # GPU 张量内容无需清零（只读前 num_pages 项）
         self.seq_len = 0

@@ -8,6 +8,9 @@ Triton PagedAttention — decode kernel（接入项目用）
   - 仅 decode（S == 1，每个请求 1 个 query 位置）
   - 仅 bf16 + CUDA（kernel 里写回 o.to(tl.bfloat16)）
   - prefill 仍走 qwen3/paged_attention.py（PyTorch 版）
+  - 依赖 Triton >= 2.2.0：2.1 的 jit 对 tl.float32 注解报
+    TypeError（'dtype' is not iterable），且默认 tl.dot 的
+    tf32 精度误差 ~0.08 会导致 token 分歧
 
 调用时机（attention.py 内）:
   decode 步: update 写入新 token 的 K/V → 逐物理页算 attention
@@ -40,7 +43,7 @@ def paged_attn_decode_kernel(
     block_size: tl.constexpr,
     num_kv_groups: tl.constexpr,
     BLOCK_G: tl.constexpr,       # q tile 行数（tl.dot 要求 >= 16，G 不足补齐）
-    scaling:tl.constexpr                     # fp32 标量（triton 2.1 不支持 dtype 注解，2.2 才可写 tl.float32）
+    scaling: tl.float32,
 ):
     pid = tl.program_id(0)
     b = pid // num_kv_heads       # batch 索引
@@ -101,7 +104,7 @@ def paged_attn_decode_kernel(
             other=0.0,
         ).to(tl.float32)   # v: (block_size, head_dim) fp32
 
-        scores = tl.dot(q, tl.trans(k)) * scaling    # (BLOCK_G, block_size)：q 行 × 页内 token 列
+        scores = tl.dot(q, tl.trans(k)) * scaling    # (BLOCK_G, block_size)
         scores = tl.where(token_mask[None, :], scores, float("-inf"))   # 无效槽位 → -inf
 
         m_new = tl.maximum(m, tl.max(scores, axis=1))   # (BLOCK_G,) 新全局 max
@@ -199,9 +202,8 @@ def triton_paged_attention_decode(q, k_new, v_new, kv_cache, layer_idx, scaling)
     k_buffer = pool.k_buffer[:, layer_idx]   # (num_blocks, num_kv_heads, block_size, head_dim)
     v_buffer = pool.v_buffer[:, layer_idx]   # 同上
 
-    # 块表：Python list → (1, num_pages) int32（B=1，unsqueeze 加批维）
-    block_table = torch.tensor(kv_cache.block_table, dtype=torch.int32, device=q.device)
-    block_table = block_table.unsqueeze(0)   # (1, num_pages)
+    # 块表：直接切 GPU 常驻张量（PagedKVCache 已同步维护，零 HtoD 拷贝）
+    block_table = kv_cache.block_table_tensor[:kv_cache.num_pages].unsqueeze(0)  # (1, num_pages)
     # seq_len 包含刚写入的新 token（旧缓存长度 + 1）
     seq_len = torch.tensor([kv_cache.seq_len + 1], dtype=torch.int32, device=q.device)  # (1,)
 
@@ -254,15 +256,14 @@ def triton_paged_attention_decode_batch(q, k_new, v_new, kv_caches, layer_idx, s
     #    kernel 需要矩形张量，但各请求页数不同（seq_len 不同）→ 右 pad 0。
     #    安全：kernel 每请求只循环 ceil(seq_len/block_size) 页（运行时边界），
     #    pad 的列永远不会被读到——与 model.py 的 mask 补列同一哲学。
-    #    数据来源：每个 PagedKVCache 的 Python list 块表 → 转 GPU int32 张量，
-    #    拷进第 i 行的前 len(block_table) 列，剩余列保持 0。
+    #    数据来源：各请求的 GPU 常驻块表张量（PagedKVCache 同步维护），
+    #    切片拷进第 i 行 —— GPU→GPU 拷贝，零 HtoD（之前每层 torch.tensor(list)）。
     pool = kv_caches[0]._pool                    # 共享全局池（所有请求同一实例）
-    max_pages = max(len(c.block_table) for c in kv_caches)   # 批内最长页表
+    max_pages = max(c.num_pages for c in kv_caches)   # 批内最长页表
     block_table = torch.zeros(B, max_pages, dtype=torch.int32, device=q.device)  # (B, max_pages)
     for i, c in enumerate(kv_caches):
-        if c.block_table:
-            block_table[i, :len(c.block_table)] = \
-                torch.tensor(c.block_table, dtype=torch.int32, device=q.device)
+        if c.num_pages:
+            block_table[i, :c.num_pages] = c.block_table_tensor[:c.num_pages]
 
     # ---- 3. 批内各请求的 seq_len: (B,) int32 ----
     #    kernel 每请求用它算 num_pages 和尾页 valid mask。
