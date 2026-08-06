@@ -78,8 +78,10 @@ class Qwen3Model(nn.Module):
             # 自己的块表）→ 直接传 None，省掉 (B,1,S,max_kv) 构造的
             # index_elementwise（profiler 显示每步 448 次，占 18%）。
             # 仅在 CPU / 非 bf16 / 强制 QWEN3_PAGED_ATTN=pytorch 时构造。
+            # 与 attention.py 的 use_triton 判断保持完全一致：
+            # S==1（decode 步）+ seq_len>0（非 prefill）+ GPU + 未强制 pytorch
             use_triton = (
-                S == 1 and input_ids.is_cuda
+                S == 1 and caches[0].seq_len > 0 and input_ids.is_cuda
                 and os.environ.get("QWEN3_PAGED_ATTN", "triton") == "triton"
             )
             if use_triton:

@@ -122,8 +122,11 @@ class Qwen3Attention(nn.Module):
             if use_triton:
                 attn_output = triton_paged_attention_decode_batch(
                     q, k, v, caches, layer_idx, self.scaling)
-            elif S > 1:
+            elif S > 1 or caches[0].seq_len == 0:
                 # ---- prefill 批：B-loop 写页 + 批 matmul 标准 attention ----
+                # 条件 S>1 或 seq_len==0：1-token prompt 的 prefill 也是 S=1，
+                #   不能误走 decode 兜底（逐请求 paged_attention），
+                #   否则状态错乱导致后续 decode 崩
                 # ① 逐请求写页（B-loop）：正确性优先。各请求块表长度不同，
                 #    真 batched update 需要拼接批量写入，留作后续优化
                 # ② 标准 attention 是批的：q/k/v 都是 (B, H, S, D)，
