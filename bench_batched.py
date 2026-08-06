@@ -229,6 +229,7 @@ def main():
         num_blocks=num_blocks, num_layers=config.num_hidden_layers,
         block_size=block_size, num_kv_heads=config.num_key_value_heads,
         head_dim=config.head_dim, device=device, dtype=dtype,
+        max_seq_len=max_seq_tokens,
     )
     print(f"[pool] {num_blocks} blocks x {block_size} "
           f"(>= {blocks_per_seq} blocks/seq x {max_batch} batch)")

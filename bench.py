@@ -182,6 +182,7 @@ def main():
         head_dim=config.head_dim,
         device=device,
         dtype=dtype,
+        max_seq_len=max_seq_tokens,
     )
     pool_mem_mb = (kv_pool.k_buffer.numel() * kv_pool.k_buffer.element_size()
                    + kv_pool.v_buffer.numel() * kv_pool.v_buffer.element_size()) / 1024**2
