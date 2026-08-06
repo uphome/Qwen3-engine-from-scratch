@@ -37,7 +37,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        kv_cache=None,   # NaiveKVCache | None
+        kv_cache=None,   # PagedKVCache | list[PagedKVCache] | None
         layer_idx: int = 0,
     ) -> torch.Tensor:
         # 自注意力 + 残差

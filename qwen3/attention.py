@@ -59,7 +59,7 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,            # (batch, seq_len, hidden_size)
         position_embeddings: tuple[torch.Tensor, torch.Tensor],  # (cos, sin)
         attention_mask: torch.Tensor,            # (1, 1, seq_len, kv_len)
-        kv_cache=None,                           # NaiveKVCache | None
+        kv_cache=None,                           # PagedKVCache | list[PagedKVCache] | None
         layer_idx: int = 0,                      # 当前是第几层
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
@@ -145,18 +145,8 @@ class Qwen3Attention(nn.Module):
                 attn_output = torch.cat(outs, dim=0)
             return self.o_proj(attn_output)
 
-        # 朴素路径：先存新的（只存新 token 的 K,V），再拼旧的做 attention
-        if kv_cache is not None:
-            k_old, v_old = kv_cache.get_kv(layer_idx)
-            kv_cache.update(layer_idx, k, v)    # 只存 k_new, v_new（S_new 个 token）
-            if k_old is not None:
-                # Decode 模式：拼上旧缓存，Q 才能看到所有历史
-                k = torch.cat([k_old, k], dim=2)
-                v = torch.cat([v_old, v], dim=2)
-
+        # 无 kv_cache（纯前向测试）：直接标准 attention
         attn_output = self._standard_attention(q, k, v, attention_mask)
-
-        # reshape 回 (B, S, hidden) 并投影输出
         return self.o_proj(attn_output)
 
     def _standard_attention(self, q, k, v, attention_mask):

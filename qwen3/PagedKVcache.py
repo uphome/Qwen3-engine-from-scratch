@@ -3,9 +3,9 @@
 
 架构：
   KVCachePool  — 全局唯一，管理 GPU 显存（k_buffer / v_buffer）
-  PagedKVCache — 每个请求一个，从池中分配块，接口兼容 NaiveKVCache
+  PagedKVCache — 每个请求一个，从池中分配块
 
-与 NaiveKVCache 接口一致：
+接口：
   - get_kv(layer_idx) → (k, v) | (None, None)
   - update(layer_idx, k_new, v_new)
   - advance_seq_len(n)
@@ -63,7 +63,7 @@ class KVCachePool:
 
 
 class PagedKVCache:
-    """请求级 KV cache —— 轻量句柄，接口兼容 NaiveKVCache
+    """请求级 KV cache —— 轻量句柄
 
     用法:
         pool = KVCachePool(num_blocks=512, num_layers=28, ...)   # 全局创建一次
