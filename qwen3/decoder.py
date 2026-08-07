@@ -39,12 +39,14 @@ class Qwen3DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         kv_cache=None,   # PagedKVCache | list[PagedKVCache] | None
         layer_idx: int = 0,
+        input_lens: list[int] | None = None,
     ) -> torch.Tensor:
         # 自注意力 + 残差
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask,
-                                       kv_cache=kv_cache, layer_idx=layer_idx)
+                                       kv_cache=kv_cache, layer_idx=layer_idx,
+                                       input_lens=input_lens)
         hidden_states = residual + hidden_states
 
         # MLP + 残差

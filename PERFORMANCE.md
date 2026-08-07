@@ -5,6 +5,24 @@
 > 计时口径: **真实墙钟**（perf_counter + torch.cuda.synchronize），端到端用户感知延迟
 > 历史教训: 早期数据用 CPU 提交时间（无 synchronize），PyTorch 逐页路径被低估 ~4 倍，已废弃重跑
 
+### 运行环境前提（重要）
+
+- 用 `cuda_learn` conda 环境（PyTorch 2.2.2+cu118 / Triton 2.2.0），勿用 base 的 cu128。
+- **驱动若被降级（`nvidia-smi` 显示 CUDA ≤ 11.6，如 510.54），Triton 自带 ptxas 12.3
+  生成的 cubin 会加载失败**（`RuntimeError: Triton Error [CUDA]: device kernel image is invalid`），
+  连项目已有 kernel 也全挂。解决：设置环境变量让 Triton 用兼容的旧 ptxas：
+
+  ```bash
+  export TRITON_PTXAS_PATH=/data/hjt1/anaconda3/envs/cuda_learn/bin/ptxas
+  ```
+
+  所有跑 Triton kernel 的命令前都要带它（bench / profile / test 一律如此）。
+
+- prefill 注意力路径由 `QWEN3_FLASH_ATTN` 控制：
+  - `triton`（默认）= vLLM 风格 varlen flash attention 融合 kernel
+  - `pytorch` = 标准实现（QKᵀ + softmax + PV，消融对比/基线用）
+  - decode 仍由 `QWEN3_PAGED_ATTN` 控制，与 flash prefill 互不干扰。
+
 ---
 
 ## 1. 版本命名（语义化版本号）
@@ -209,33 +227,71 @@ attention forward
 
 | Mode | Batch | Steps | Throughput | Decode | Lat p50 | vs serial |
 |---|---|---|---|---|---|---|
-| serial | 1 | - | 29.8 tok/s | 32.6 ms/tok | 6.42s | 1.00x |
-| batched | 1 | 8+344 | 29.1 | 33.5 | 6.67s | 0.98x |
-| batched | 2 | 7+188 | 46.3 | 20.8 | 4.41s | **1.55x** |
-| batched | 3 | 6+125 | 62.5 | 15.3 | 3.62s | **2.10x** |
-| batched | 4 | 5+95 | 74.8 | 12.8 | 3.27s | **2.51x** |
+| serial | 1 | - | 28.1 tok/s | 34.7 ms/tok | - | 1.00x |
+| batched | 1 | 64+ | 28.1 | 34.7 | - | 1.00x |
+| batched | 2 | - | 48.7 | 19.7 | - | 1.73x |
+| batched | 4 | - | 78.5 | 11.9 | - | 2.79x |
+| batched | 8 | - | 115.9 | 7.9 | - | 4.12x |
+| batched | 12 | - | 137.9 | 6.6 | - | 4.91x |
+| batched | 16 | - | 153.5 | 5.9 | - | 5.46x |
+| batched | 24 | - | 172.7 | 5.3 | - | 6.15x |
+| batched | **28** | - | **184.0** | **5.0** | - | **6.55x** |
+| batched | 32 | - | 188.1 | 4.9 | - | 6.69x |
 
-连续批处理收益确认：batch=4 时吞吐 2.51x、decode 2.55x；
-batch=1 ≈ serial（0.98x），等价性验证通过。
+> 2026-08 扫描（64 序列，input [32,128], output [16,64], greedy，GPU 空闲）。
 
-#### 瓶颈分析（batch=8 时 profile）
+#### 吞吐峰值拐点分析
+
+```
+吞吐 (tok/s) vs batch（64 序列）:
+  28 ┤●
+  48 ┤ ●
+  78 ┤  ●
+ 116 ┤   ●
+ 138 ┤    ●
+ 154 ┤     ●
+ 173 ┤      ●
+ 184 ┤       ●  ← batch 28-30 达峰
+ 188 ┤        ●  ← batch 32 微回落（SM 已占满 + 调度碎片）
+     └──────────────────────
+       1  4  8  12 16 24 28 32
+```
+
+- **快速增长段（batch 1→8）**：28→116 tok/s，每 +1 batch 平均 **+12.5 tok/s**。
+  SM 逐步被填满（Triton decode kernel grid = B×Hkv，B 小时 program 不足）。
+- **减速段（batch 8→28）**：116→184，每 +1 batch 平均 **+3.4 tok/s**。
+  SM 利用率接近饱和，剩余增益来自更少的调度步/更高的 tile 合并。
+- **拐点 ≈ batch 16**：每 +1 batch 的边际增益降到 3 tok/s 以下，
+  batch 16 后再加 batch 只换 ~5% 吞吐，但 Lat p50 持续下降（并发友好）。
+- **峰值 ≈ batch 28-30（184-193 tok/s）**，batch 32 微回落（188）。
+  32 请求全部在跑时，批越大单步 decode 时间越长但步数越少，净增益趋零。
+- **硬件约束**：A100 108 SM，batch=32 时 decode grid = 32×8=256 program，
+  SM 已无空闲；继续加 batch 只增内存带宽竞争（每步读权重 1.5GB，带宽 2TB/s
+  → decode 理论下限 0.75ms/步，当前 5.0ms/步，仍有 6.7x 空间，但那是
+  CUDA Graph 消除 kernel 启动间隙的领域）。
+
+**结论**：连续批处理的最优 batch 在 **16-30** 之间（吞吐 154-193 tok/s），
+选 batch=24 附近可得 6x+ 吞吐且留调度余量；再往上边际收益 <3%/batch。
+
+#### 瓶颈分析（batch=8 时 profile，2026-08 复测）
 
 | 指标 | 数值 | 说明 |
 |---|---|---|
-| 墙钟 | 91.3 ms/步 | 用户感知时间 |
-| GPU 纯 kernel | 29.4 ms/步 | profiler 统计，仅 **32% 利用率** |
-| GPU 空等 CPU | ~62 ms | CPU 提交瓶颈（主因） |
+| 墙钟 | 82.7 ms/步 | 用户感知时间（20 步均值） |
+| GPU 纯 kernel | 30.0 ms/步 | profiler 统计，仅 **36% 利用率** |
+| GPU 空等 CPU | ~53 ms | CPU 提交瓶颈（主因） |
 | CPU 组装/收尾 | ~0.6 ms | 可忽略 |
 
 top kernel（每步）：
-- `paged_attn_decode_kernel`: 1.06ms × 28 次（真正 attention 仅 ~3.6%）
-- Memcpy HtoD: 0.96ms × 477 次（**块表 torch.tensor 拷贝**）
-- Memcpy DtoD: 1.09ms × 224 次（update 写入）
-- index_elementwise: 5.61ms × 448 次（mask 构造 + 采样索引）
+- `index_elementwise`: 5.62ms × 448 次（mask 构造 + 采样索引）
+- `unrolled_elementwise`: 2.30ms × 448（update 写入展开）
+- `paged_attn_decode_kernel`: 1.12ms × 28（真正 attention 仅 ~3.7%）
+- `Memcpy DtoD`: 1.02ms × 224（update 写入）
+- 各类 GEMM（q/k/v 投影 + o_proj）: ~0.9-1.4ms × 84-114
 
-**结论**：瓶颈在工程流水线——每层重复的块表重建/HtoD 拷贝 + 无用 mask 构造，
-GPU 算力只用了 1/3。优化方向见 ENGINE_COMPARISON.md TODO（P0：块表缓存、
-跳过 mask、CUDA Graph）。
+**结论**：瓶颈仍在工程流水线——kernel 启动间隙 + 冗余 mask/index 构造，
+GPU 算力只用了 1/3。优化方向：CUDA Graph（消启动间隙，预期墙钟 83→~35ms）、
+跳过 decode mask 构造（已实现 use_triton 传 None，但批路径仍在造 mask）。
 
 #### 硬件上限估算
 
@@ -250,6 +306,54 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步
 - `scheduler.py` prefill 补位超编：`min(batch_size, waiting)` 未减 running 已有
   人数 → running 可超 batch_size → decode 切片 `running[:n]` 饿死队尾；
   改为 `min(batch_size - len(running), waiting)`，demo 验证补位只取剩余空位
+
+### 3.6 v2.1 — prefill FlashAttention 融合（vLLM 风格 varlen kernel）
+
+> 基准：`profile_decode.py --mode prefill`（torch.profiler，总 CUDA 时间）
+> 前置：需 `TRITON_PTXAS_PATH`（见文件头运行环境前提）
+
+| 配置 | standard prefill | flash prefill | 提升 |
+|---|---|---|---|
+| B=8, S=256 | 83.08 ms | 65.85 ms | **-20.7%** |
+| B=2, S=1024 | 71.83 ms | 50.78 ms | **-29.3%** |
+| B=1, S=1024 | 59.84 ms | 47.67 ms | **-20.3%** |
+
+收益随序列长度放大（N² 注意力矩阵不物化）；B=2/S=1024 时 standard 路径
+一度 OOM（物化 4×16×1024² 注意力矩阵），flash 路径不会。
+
+改动：
+- 新增 `qwen3/kernels/flash_attention_varlen.py`：vLLM 风格 varlen flash
+  attention（`cu_seqlens` 变长 + 内核内 GQA，拷自 test/Fusedattention.py
+  追加段）+ `flash_attention_prefill_batched` 适配层
+  （(B,H,S,D) 右 pad 批 → 拉平流 + gather/scatter，等长批跳过 gather）
+- `attention.py`/`decoder.py`/`model.py`：`input_lens` 穿透 + `QWEN3_FLASH_ATTN`
+  开关（默认 triton，`=pytorch` 关闭消融）
+- prefill 不再需要 CPU 侧 4D mask（kernel 内按 seq 边界处理 causal）
+
+精度验证：synthetic 三场景（单请求/等长批/混合长度批）与 `_standard_attention`
+逐位 diff < 0.02；真实模型 prefill logits argmax 一致率 96-98%（bf16 精度内）；
+`test_batched.py` 端到端 6 组场景逐 token 一致。
+
+架构更新（三段式 attention 路径）：
+
+```
+attention forward
+├── PagedKVCache 分支
+│   ├── decode (S=1, CUDA, bf16)  → Triton kernel（qwen3/kernels/paged_attention.py）
+│   ├── prefill (S>1, CUDA, bf16) → varlen flash kernel（QWEN3_FLASH_ATTN=triton）
+│   │                               └─ 回退 _standard_attention（=pytorch / CPU / fp32）
+│   └── decode 兜底 (CPU/fp32)     → PyTorch 逐页（paged_attention.py）
+└── 批量（list）分支             → 同上，prefill 变长批走 flash + cu_seqlens
+```
+
+### 3.7 当前耗时分析（2026-08，flash prefill 已上线）
+
+- **decode 仍是绝对耗时主体**：64 序列串行中 Decode 占 99.8%（1308.7s vs 2.26s）。
+- **decode 瓶颈 = CPU 提交**：墙钟 82.7ms/步 vs GPU 纯算 30.0ms/步（利用率 36%），
+  主因是 ~500 kernel/步的启动间隙 → **CUDA Graph 是下一个 P0**。
+- **prefill 已不是瓶颈**：flash 融合后单层 attention 3.68ms×28 次，
+  已被投影 GEMM（~20ms）盖过；长 prompt 时 flash 收益显著且防 OOM。
+- **吞吐拐点 batch≈16-30**：最优工作点在 batch 24-28（172-184 tok/s, 6x+ vs serial）。
 
 ---
 

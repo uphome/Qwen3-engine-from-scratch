@@ -140,7 +140,7 @@ class Qwen3Model(nn.Module):
         # 层内根据 layer_idx 取每个请求自己的第 i 层缓存
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, causal_mask, position_embeddings,
-                                  kv_cache=caches, layer_idx=i)
+                                  kv_cache=caches, layer_idx=i, input_lens=lens)
 
         # ---- ③ 逐请求推进缓存进度 ----
         # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），
