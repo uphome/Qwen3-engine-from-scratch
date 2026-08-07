@@ -34,12 +34,14 @@ v0.1  NaiveKVCache 基线（无分页）
 v0.2  PagedKVCache（存储层分页：共享池 + 块表，计算仍标准 attention）
 v1.0  PagedAttention（计算层分页：Triton decode kernel + dtype 修复）
 v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正）
-v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4，当前开发中）
+v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4）
+v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
 - **v1.x = PagedAttention 时代**（计算也分页，主版本跨入 1.0）
 - **v2.x = Continuous Batching 时代**（多请求并发调度，吞吐量级提升）
+- **v2.1 起 = prefill 计算融合**（QKᵀ/softmax/PV 折叠进单个 Triton kernel）
 
 ---
 
@@ -53,19 +55,30 @@ v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4，当前开发中）
 | v0.2 | 9bfbba3 | PagedKVCache + 重建连续 K/V | 27.13 | 34.6 | 562.0 | 3.89 |
 | v1.0 | 3ec469b | Triton decode kernel + dtype 修复 | 27.16 | 34.6 | 864.6 | 2.06 |
 | v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
+| v2.1 | f3c2d40 | + flash prefill 融合 kernel | 29.27 | 34.1 | **35.3** | 2.06 |
 
 > v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
-> 同环境重跑；v1.1 为当前版本实测。
+> 同环境重跑；v1.1 为当时版本实测；v2.1 为本次（2026-08，64 序列）实测。
+>
+> **注意**：v2.1 单请求串行下与 v1.1 基本持平（29.27 vs 29.58 tok/s）——
+> prefill 融合 kernel 的收益在**长 prompt / 大 batch**（N² 不物化防 OOM），
+> 单请求短序列下 decode 仍占 99.8% 墙钟，prefill 优化对整体吞吐无感
+> （详见 3.6/3.7 的专项剖析）。
 
-### 2.2 连续批处理（bench_batched.py，16 序列，GPU 空闲）
+### 2.2 连续批处理（bench_batched.py，GPU 空闲）
 
 | Mode | Batch | Throughput | Decode | Lat p50 | vs serial |
 |---|---|---|---|---|---|
-| serial | 1 | 29.8 tok/s | 32.6 ms/tok | 6.42s | 1.00x |
-| batched | 1 | 29.1 | 33.5 | 6.67s | 0.98x |
-| batched | 2 | 46.3 | 20.8 | 4.41s | **1.55x** |
-| batched | 3 | 62.5 | 15.3 | 3.62s | **2.10x** |
-| batched | 4 | 74.8 | 12.8 | 3.27s | **2.51x** |
+| serial | 1 | 28.1 tok/s | 34.7 ms/tok | - | 1.00x |
+| batched | 2 | 48.7 | 19.7 | - | 1.73x |
+| batched | 4 | 78.5 | 11.9 | - | 2.79x |
+| batched | 8 | 115.9 | 7.9 | - | 4.12x |
+| batched | 16 | 153.5 | 5.9 | - | 5.46x |
+| batched | **28** | **184.0** | **5.0** | - | **6.55x** |
+| batched | 32 | 188.1 | 4.9 | - | 6.69x |
+
+> 2026-08 扫描（64 序列，input [32,128], output [16,64], greedy）。
+> 完整数据与拐点分析见 3.5 节。
 
 ### 2.3 关键发现
 
@@ -74,8 +87,10 @@ v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4，当前开发中）
 2. **分页/Triton 的价值在并发**：开销靠 continuous batching 摊薄——这是做并发调度的动机。
 3. **prefill 优化收益最大**：v1.0 逐页 864.6ms → v1.1 标准 attention 35.0ms（-96%）。
 4. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），对速度无贡献（v1.0 vs v0.2 decode 相同）。
-5. **当前瓶颈在工程流水线**：GPU 纯算 29ms/步 vs 墙钟 91ms/步（利用率仅 32%），
-   详见 v2.0 的瓶颈分析。
+5. **吞吐峰值拐点 ≈ batch 16-30**：batch 1→8 每 +1 batch 平均 +12.5 tok/s（SM 填满），
+   之后边际增益 <3 tok/s/batch；峰值 184-193 tok/s（batch 28-30），6.5x+ vs serial。
+6. **当前瓶颈在工程流水线**：decode 墙钟 82.7ms/步 vs GPU 纯算 30.0ms/步
+   （利用率 36%，kernel 启动间隙），详见 3.7。
 
 ---
 
@@ -217,10 +232,10 @@ attention forward
 - fp32 vs bf16 贪心输出: 40/40 token 一致（dtype 修复无精度退化）
 - naive(cat) vs paged(Triton decode): 48/48 token 一致
 
-### 3.5 v2.0 — 连续批处理（当前开发中）
+### 3.5 v2.0 — 连续批处理
 
 > 引擎：Scheduler + Request + Batch（qwen3/scheduler.py 等）
-> 基准：`bench_batched.py`（16 序列，batch 1-4 扫描，GPU 2 空闲，真实墙钟）
+> 基准：`bench_batched.py`（64 序列，batch 1-32 扫描，GPU 空闲，真实墙钟）
 > 请求规格: input [32,128], output [16,64], greedy, eos 关闭
 
 #### 批扫描结果
@@ -298,7 +313,7 @@ GPU 算力只用了 1/3。优化方向：CUDA Graph（消启动间隙，预期�
 ```
 0.6B bf16 权重 = 1.5 GB；A100 带宽 ≈ 2 TB/s
 decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步
-当前 91ms/步 vs 硬件极限 0.75ms → 软件层瓶颈（非硬件），优化空间 ~120 倍
+当前 82.7ms/步 vs 硬件极限 0.75ms → 软件层瓶颈（非硬件），优化空间 ~110 倍
 ```
 
 #### 本轮修复（调度器 bug）
