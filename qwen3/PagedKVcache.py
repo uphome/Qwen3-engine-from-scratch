@@ -3,9 +3,9 @@
 
 架构：
   KVCachePool  — 全局唯一，管理 GPU 显存（k_buffer / v_buffer）
-  PagedKVCache — 每个请求一个，从池中分配块，接口兼容 NaiveKVCache
+  PagedKVCache — 每个请求一个，从池中分配块
 
-与 NaiveKVCache 接口一致：
+接口：
   - get_kv(layer_idx) → (k, v) | (None, None)
   - update(layer_idx, k_new, v_new)
   - advance_seq_len(n)
@@ -19,11 +19,16 @@ class KVCachePool:
     """全局物理块池——所有请求共享，进程启动时创建一次"""
 
     def __init__(self, num_blocks: int, num_layers: int, block_size: int,
-                 num_kv_heads: int, head_dim: int, device=None, dtype=None):
+                 num_kv_heads: int, head_dim: int, device=None, dtype=None,
+                 max_seq_len: int = 2048):
         self.num_layers = num_layers
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        # 单请求的最大序列长度（prompt + 生成）。决定每个请求块表张量的
+        # 预留大小（max_pages = ceil(max_seq_len / block_size)），
+        # 与池子总块数无关——一个请求不可能用完全部池子。
+        self.max_seq_len = max_seq_len
 
 
         # KVCachePool 用 torch.empty 初始化，未写入槽位是垃圾数据（可能含 NaN/±inf）
@@ -58,7 +63,7 @@ class KVCachePool:
 
 
 class PagedKVCache:
-    """请求级 KV cache —— 轻量句柄，接口兼容 NaiveKVCache
+    """请求级 KV cache —— 轻量句柄
 
     用法:
         pool = KVCachePool(num_blocks=512, num_layers=28, ...)   # 全局创建一次
@@ -74,13 +79,20 @@ class PagedKVCache:
 
         # GPU 常驻块表张量：kernel / update 直接读它，避免每层
         # torch.tensor(list) 的 HtoD 拷贝（profiler 显示每步 ~477 次）。
-        # 大小预留 total_blocks（一个请求最多可占用全部块），前 num_pages 项有效。
+        # 大小按"单请求最大页数"预留（max_seq_len / block_size），而非
+        # 池子总块数——一个请求不可能用完全部池子，避免过度预留。
+        max_pages = (pool.max_seq_len + pool.block_size - 1) // pool.block_size
         self.block_table_tensor = torch.full(
-            (pool.total_blocks,), -1, dtype=torch.int32,
+            (max_pages,), -1, dtype=torch.int32,
             device=pool.k_buffer.device)
         self.num_pages = 0       # 当前已分配的页数（与 len(block_table) 同步）
 
     def _allocate_block(self):
+        # 越界保护：超过 max_seq_len 对应的页数说明请求超长，
+        # 显式报错而不是写穿张量（静默内存破坏）
+        max_pages = self.block_table_tensor.shape[0]
+        assert self.num_pages < max_pages, \
+            f"请求超过 max_seq_len（{self._pool.max_seq_len} tokens / {max_pages} 页）"
         new = self._pool.alloc(1)
         self.block_table.append(new[0])
         self.block_table_tensor[self.num_pages] = new[0]   # GPU 张量同步写

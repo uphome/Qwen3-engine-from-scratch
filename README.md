@@ -37,11 +37,21 @@ python main.py --model /path/to/Qwen3-0.6B --prompt "你好" --temperature 0
 ## Benchmark
 
 ```bash
+# 环境前提：若 nvidia-smi 显示驱动 CUDA <= 11.6（如 510.54），Triton 自带
+# ptxas 12.3 生成的 cubin 加载失败，必须先指定兼容的旧 ptxas（见 PERFORMANCE.md）：
+export TRITON_PTXAS_PATH=/data/hjt1/anaconda3/envs/cuda_learn/bin/ptxas
+
+# prefill 注意力默认走 vLLM 风格 varlen flash attention 融合 kernel（QWEN3_FLASH_ATTN=triton）
+# 关闭融合走标准实现（消融对比）：export QWEN3_FLASH_ATTN=pytorch
+
 # 基础吞吐测试
 python bench.py --model /path/to/Qwen3-0.6B --num-seqs 64
 
 # 带 profiler trace，定位 kernel 级瓶颈
 python bench.py --model /path/to/Qwen3-0.6B --profile --profile-output trace.json
+
+# prefill/decode 步 kernel 时间分布（--mode prefill 剖析融合 kernel）
+python profile_decode.py --model /path/to/Qwen3-0.6B --mode prefill --prompt-len 256
 ```
 
 已有指标：吞吐（tok/s）、延迟分布（p50/p95/p99）、VRAM 占用、Prefill/Decode 占比、算子级 CUDA 耗时排名。

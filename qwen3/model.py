@@ -5,6 +5,8 @@ Qwen3ForCausalLM — 完整语言模型（backbone + lm_head）
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -71,22 +73,33 @@ class Qwen3Model(nn.Module):
                                      device=input_ids.device)
             position_ids = start_pos.unsqueeze(1).expand(B, S) #decode模式 S=1
 
-            # ---- ② mask (B, 1, S, max_kv)：批安全的灵魂 ----
-            # 问题：attention 的 K/V 张量在 batch 内必须矩形 (B, H, max_kv, D)，
-            #       但各请求 kv_len 不同，短请求要"补齐"到 max_kv。
-            #       补齐的列是别的请求的 KV——绝不能让它看到！
-            # 解法：初始全 0（可见），逐请求把"自己 kv_len 之外"的列置 -inf，
-            #       softmax 权重为 0 → 请求间逻辑隔离。
-            #       例: 请求 A kv=110 → 全可见；请求 B kv=60 → 后 50 列 -inf。
-            # 注意：decode 走 Triton kernel 时不看 mask（kernel 每请求单独跑，
-            #       只读自己的块表），此 mask 是 PyTorch 兜底路径（CPU/prefill）用的。
-            max_kv = max(c.seq_len + S for c in caches)
-            causal_mask = torch.zeros(B, 1, S, max_kv, device=input_ids.device,
-                                      dtype=hidden_states.dtype)
-            for i, c in enumerate(caches):
-                kv_len_i = c.seq_len + S
-                if kv_len_i < max_kv:
-                    causal_mask[i, :, :, kv_len_i:] = float("-inf")
+            # ---- ② mask：仅 PyTorch 兜底路径需要 ----
+            # decode 走 Triton kernel 时不看 mask（kernel 每请求单独跑，只读
+            # 自己的块表）→ 直接传 None，省掉 (B,1,S,max_kv) 构造的
+            # index_elementwise（profiler 显示每步 448 次，占 18%）。
+            # 仅在 CPU / 非 bf16 / 强制 QWEN3_PAGED_ATTN=pytorch 时构造。
+            # 与 attention.py 的 use_triton 判断保持完全一致：
+            # S==1（decode 步）+ seq_len>0（非 prefill）+ GPU + 未强制 pytorch
+            use_triton = (
+                S == 1 and caches[0].seq_len > 0 and input_ids.is_cuda
+                and os.environ.get("QWEN3_PAGED_ATTN", "triton") == "triton"
+            )
+            if use_triton:
+                causal_mask = None
+            else:
+                # 问题：attention 的 K/V 张量在 batch 内必须矩形 (B, H, max_kv, D)，
+                #       但各请求 kv_len 不同，短请求要"补齐"到 max_kv。
+                #       补齐的列是别的请求的 KV——绝不能让它看到！
+                # 解法：初始全 0（可见），逐请求把"自己 kv_len 之外"的列置 -inf，
+                #       softmax 权重为 0 → 请求间逻辑隔离。
+                #       例: 请求 A kv=110 → 全可见；请求 B kv=60 → 后 50 列 -inf。
+                max_kv = max(c.seq_len + S for c in caches)
+                causal_mask = torch.zeros(B, 1, S, max_kv, device=input_ids.device,
+                                          dtype=hidden_states.dtype)
+                for i, c in enumerate(caches):
+                    kv_len_i = c.seq_len + S
+                    if kv_len_i < max_kv:
+                        causal_mask[i, :, :, kv_len_i:] = float("-inf")
             lens = [S] * B
         else:
             # ---- Prefill 批模式 ----
@@ -127,7 +140,7 @@ class Qwen3Model(nn.Module):
         # 层内根据 layer_idx 取每个请求自己的第 i 层缓存
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, causal_mask, position_embeddings,
-                                  kv_cache=caches, layer_idx=i)
+                                  kv_cache=caches, layer_idx=i, input_lens=lens)
 
         # ---- ③ 逐请求推进缓存进度 ----
         # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），

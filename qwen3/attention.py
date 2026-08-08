@@ -25,6 +25,7 @@ from .rope import apply_rotary_pos_emb
 from .PagedKVcache import PagedKVCache
 from .paged_attention import paged_attention
 from .kernels.paged_attention import triton_paged_attention_decode, triton_paged_attention_decode_batch
+from .kernels.flash_attention_varlen import flash_attention_prefill_batched
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -59,8 +60,9 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,            # (batch, seq_len, hidden_size)
         position_embeddings: tuple[torch.Tensor, torch.Tensor],  # (cos, sin)
         attention_mask: torch.Tensor,            # (1, 1, seq_len, kv_len)
-        kv_cache=None,                           # NaiveKVCache | None
+        kv_cache=None,                           # PagedKVCache | list[PagedKVCache] | None
         layer_idx: int = 0,                      # 当前是第几层
+        input_lens: list[int] | None = None,     # prefill 批各请求有效长度（flash 路径用）
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
@@ -93,7 +95,16 @@ class Qwen3Attention(nn.Module):
                 # prefill：K/V 本来就是连续张量，直接标准 attention（vLLM 同款做法），
                 # 顺带写入分页供 decode 使用；不做"写页→逐页读回"的白折腾
                 kv_cache.update(layer_idx, k, v)
-                attn_output = self._standard_attention(q, k, v, attention_mask)
+                use_flash = (
+                    q.is_cuda
+                    and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
+                )
+                if use_flash:
+                    attn_output = flash_attention_prefill_batched(
+                        q, k, v, [S], self.scaling,
+                        self.num_heads, self.num_kv_heads, self.head_dim)
+                else:
+                    attn_output = self._standard_attention(q, k, v, attention_mask)
             else:
                 # decode 兜底（CPU/非 bf16/强制 PyTorch）：逐页实现
                 attn_output = paged_attention(q, k, v, kv_cache, layer_idx,
@@ -122,15 +133,30 @@ class Qwen3Attention(nn.Module):
             if use_triton:
                 attn_output = triton_paged_attention_decode_batch(
                     q, k, v, caches, layer_idx, self.scaling)
-            elif S > 1:
+            elif S > 1 or caches[0].seq_len == 0:
                 # ---- prefill 批：B-loop 写页 + 批 matmul 标准 attention ----
+                # 条件 S>1 或 seq_len==0：1-token prompt 的 prefill 也是 S=1，
+                #   不能误走 decode 兜底（逐请求 paged_attention），
+                #   否则状态错乱导致后续 decode 崩
                 # ① 逐请求写页（B-loop）：正确性优先。各请求块表长度不同，
                 #    真 batched update 需要拼接批量写入，留作后续优化
                 # ② 标准 attention 是批的：q/k/v 都是 (B, H, S, D)，
                 #    matmul 一次算 B 个请求（大矩阵吃满 cuBLAS）——性能关键在这
                 for i, c in enumerate(caches):
                     c.update(layer_idx, k[i:i + 1], v[i:i + 1])
-                attn_output = self._standard_attention(q, k, v, attention_mask)
+                use_flash = (
+                    q.is_cuda
+                    and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
+                )
+                if use_flash:
+                    # vLLM 风格 varlen flash attention：内核内 GQA + 变长，
+                    # 不需要 repeat_kv / 4D mask，lens 给出各请求有效长度
+                    lens = input_lens if input_lens is not None else [S] * B
+                    attn_output = flash_attention_prefill_batched(
+                        q, k, v, lens, self.scaling,
+                        self.num_heads, self.num_kv_heads, self.head_dim)
+                else:
+                    attn_output = self._standard_attention(q, k, v, attention_mask)
             else:
                 # ---- decode 批兜底（CPU/非 bf16）：逐请求 PyTorch 逐页实现 ----
                 # ① mask 切列：model.py 造的是 (B,1,S,max_kv) 矩形 mask
@@ -145,18 +171,8 @@ class Qwen3Attention(nn.Module):
                 attn_output = torch.cat(outs, dim=0)
             return self.o_proj(attn_output)
 
-        # 朴素路径：先存新的（只存新 token 的 K,V），再拼旧的做 attention
-        if kv_cache is not None:
-            k_old, v_old = kv_cache.get_kv(layer_idx)
-            kv_cache.update(layer_idx, k, v)    # 只存 k_new, v_new（S_new 个 token）
-            if k_old is not None:
-                # Decode 模式：拼上旧缓存，Q 才能看到所有历史
-                k = torch.cat([k_old, k], dim=2)
-                v = torch.cat([v_old, v], dim=2)
-
+        # 无 kv_cache（纯前向测试）：直接标准 attention
         attn_output = self._standard_attention(q, k, v, attention_mask)
-
-        # reshape 回 (B, S, hidden) 并投影输出
         return self.o_proj(attn_output)
 
     def _standard_attention(self, q, k, v, attention_mask):

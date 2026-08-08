@@ -202,7 +202,7 @@ def triton_paged_attention_decode(q, k_new, v_new, kv_cache, layer_idx, scaling)
     k_buffer = pool.k_buffer[:, layer_idx]   # (num_blocks, num_kv_heads, block_size, head_dim)
     v_buffer = pool.v_buffer[:, layer_idx]   # 同上
 
-    # 块表：直接切 GPU 常驻张量（PagedKVCache 已同步维护，零 HtoD 拷贝）
+    # 块表：直接切 GPU 常驻张量（PagedKVCache 已同步维护，零 HtoD 拷贝）  张量切片 零开销
     block_table = kv_cache.block_table_tensor[:kv_cache.num_pages].unsqueeze(0)  # (1, num_pages)
     # seq_len 包含刚写入的新 token（旧缓存长度 + 1）
     seq_len = torch.tensor([kv_cache.seq_len + 1], dtype=torch.int32, device=q.device)  # (1,)
