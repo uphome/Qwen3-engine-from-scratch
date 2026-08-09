@@ -63,6 +63,7 @@ class Qwen3Attention(nn.Module):
         kv_cache=None,                           # PagedKVCache | list[PagedKVCache] | None
         layer_idx: int = 0,                      # 当前是第几层
         input_lens: list[int] | None = None,     # prefill 批各请求有效长度（flash 路径用）
+        row_ids: torch.Tensor | None = None,     # decode 批常驻 2D 块表行号（每步组装一次）
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
@@ -132,7 +133,7 @@ class Qwen3Attention(nn.Module):
             )
             if use_triton:
                 attn_output = triton_paged_attention_decode_batch(
-                    q, k, v, caches, layer_idx, self.scaling)
+                    q, k, v, caches, layer_idx, self.scaling, row_ids)
             elif S > 1 or caches[0].seq_len == 0:
                 # ---- prefill 批：B-loop 写页 + 批 matmul 标准 attention ----
                 # 条件 S>1 或 seq_len==0：1-token prompt 的 prefill 也是 S=1，

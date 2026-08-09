@@ -61,6 +61,7 @@ class Qwen3Model(nn.Module):
         # Token embedding: 每个 token ID -> 向量
         hidden_states = self.embed_tokens(input_ids)
 
+        row_ids = None   # decode 批的常驻 2D 块表行号（prefill/兜底路径不用）
         if caches is not None and caches[0].seq_len > 0:
             # ---- Decode 模式 ----
             # ① position_ids 必须逐请求独立：
@@ -84,8 +85,19 @@ class Qwen3Model(nn.Module):
                 S == 1 and caches[0].seq_len > 0 and input_ids.is_cuda
                 and os.environ.get("QWEN3_PAGED_ATTN", "triton") == "triton"
             )
+            row_ids = None
             if use_triton:
                 causal_mask = None
+                # ---- ③ 常驻 2D 块表：层循环外每步只做一次 ----
+                # 预留本步新 token 的物理页（跨页边界时申请，每请求至多 1 页），
+                # 保证 28 层循环内块表完全稳定；行号组装一次，各层共享。
+                # kernel 直接引用 pool.block_table_2d / pool.seq_lens，
+                # 层内零组装、零 HtoD（旧版每层 zeros + B 次行拷贝 + seq_len HtoD）。
+                for c in caches:
+                    c.reserve_next()
+                row_ids = torch.tensor(
+                    [c.row_id for c in caches],
+                    dtype=torch.int32, device=input_ids.device)
             else:
                 # 问题：attention 的 K/V 张量在 batch 内必须矩形 (B, H, max_kv, D)，
                 #       但各请求 kv_len 不同，短请求要"补齐"到 max_kv。
@@ -138,9 +150,11 @@ class Qwen3Model(nn.Module):
 
         # 逐层前向传播：caches（list）整包传给每层，
         # 层内根据 layer_idx 取每个请求自己的第 i 层缓存
+        # row_ids：decode 批在层循环外组装一次的常驻 2D 块表行号，各层共享
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, causal_mask, position_embeddings,
-                                  kv_cache=caches, layer_idx=i, input_lens=lens)
+                                  kv_cache=caches, layer_idx=i, input_lens=lens,
+                                  row_ids=row_ids)
 
         # ---- ③ 逐请求推进缓存进度 ----
         # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），
