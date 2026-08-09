@@ -20,7 +20,7 @@ class KVCachePool:
 
     def __init__(self, num_blocks: int, num_layers: int, block_size: int,
                  num_kv_heads: int, head_dim: int, device=None, dtype=None,
-                 max_seq_len: int = 2048):
+                 max_seq_len: int = 2048, max_requests: int = 256):
         self.num_layers = num_layers
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
@@ -30,6 +30,15 @@ class KVCachePool:
         # 与池子总块数无关——一个请求不可能用完全部池子。
         self.max_seq_len = max_seq_len
 
+        # GPU 常驻 2D 块表 + seq_len：所有请求的页表/长度共享一张大表，
+        # 每请求占一行（row_id 槽位）。update/reserve 用 index 赋值同步，
+        # decode 时层循环直接引用（零组装、零 HtoD，见 update_kv_batch）。
+        max_pages = (max_seq_len + block_size - 1) // block_size
+        self.block_table_2d = torch.full(
+            (max_requests, max_pages), -1, dtype=torch.int32, device=device)
+        self.seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
+        self._free_rows = list(range(max_requests))
+        self.max_requests = max_requests
 
         # KVCachePool 用 torch.empty 初始化，未写入槽位是垃圾数据（可能含 NaN/±inf）
         # → decode 时 QK^T 溢出 + mask 的 -inf 相加产生 NaN → 输出全 0。
@@ -46,11 +55,20 @@ class KVCachePool:
         self.total_blocks = num_blocks
 
     def alloc(self, n: int):
-        """从空闲池取出 n 个物理块，返回块 ID 列表"""
+        """从空闲池取出 n 个物理块，返回块 ID 列表
+
+        归还后重新分发的块先清零 K/V 内容：新请求的 prefill 只覆盖自己写入的
+        槽位，若不清零，decode 的 seq_len 增长到未覆盖槽时会读到上一请求的
+        残留 KV → 跨请求串扰（vLLM 的 --zero-initialized-kv-cache 同理）。
+        首次分配的块在 __init__ 已是 torch.zeros，无需重复清零。
+        """
         if len(self.free_block_ids) < n:
             raise RuntimeError(f"OOM: 请求 {n} 块, 剩余 {len(self.free_block_ids)} / {self.total_blocks}")
         allocated = self.free_block_ids[-n:]  # 拿出最后 n 个
         del self.free_block_ids[-n:]          # 直接在原列表上删除最后 n 个（原地操作）
+        for blk in allocated:
+            self.k_buffer[blk].zero_()
+            self.v_buffer[blk].zero_()
         return allocated
 
     def free(self, block_ids: list):
@@ -60,6 +78,43 @@ class KVCachePool:
     @property
     def free_count(self):
         return len(self.free_block_ids)
+
+    # ---- 常驻 2D 块表：行槽位管理 ----
+
+    def alloc_row(self) -> int:
+        """为新请求分配一个常驻表行号（GPU 端 seq_lens 清零）"""
+        if not self._free_rows:
+            raise RuntimeError(
+                f"OOM: 请求行槽位耗尽（max_requests={self.max_requests}），"
+                f"增大 KVCachePool(max_requests=...)")
+        row = self._free_rows.pop()
+        self.seq_lens[row] = 0
+        return row
+
+    def free_row(self, row: int):
+        """请求结束归还行号（表内容无需清零，num_pages 只读前 n 项）"""
+        self._free_rows.append(row)
+
+    def update_kv_batch(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor,
+                        row_ids: torch.Tensor):
+        """批量写 K/V（decode 批，纯 GPU，一次 kernel 写 B 个请求各 1 token）
+
+        k_new, v_new: (B, num_kv_heads, 1, head_dim)
+        row_ids:      (B,) int32，各请求在常驻 2D 块表中的行号
+
+        前提：本步已在层循环外 reserve_next()（页表已就绪），此处不做分配。
+        与旧版逐请求 Python 循环 update() 的区别：write_pos/物理页全部用
+        GPU gather（seq_lens[row_ids] / block_table_2d[row_ids, block_idx]），
+        B 个请求合并成一次 advanced-indexing 写入。
+        """
+        write_pos = self.seq_lens[row_ids]              # (B,) 各请求当前 seq_len
+        block_idx = write_pos // self.block_size        # (B,) 逻辑页
+        offset = write_pos % self.block_size            # (B,) 页内偏移
+        phys_ids = self.block_table_2d[row_ids, block_idx]  # (B,) 物理页号（GPU gather）
+
+        # k_new (B, Hkv, 1, D) → (B, Hkv, D)；左式 (B, Hkv, D)（advanced indexing）
+        self.k_buffer[phys_ids, layer_idx, :, offset] = k_new.squeeze(2)
+        self.v_buffer[phys_ids, layer_idx, :, offset] = v_new.squeeze(2)
 
 
 class PagedKVCache:
@@ -77,14 +132,12 @@ class PagedKVCache:
         self.seq_len = 0
         self.block_table = []    # 逻辑块表（Python list，兼容旧接口）
 
-        # GPU 常驻块表张量：kernel / update 直接读它，避免每层
-        # torch.tensor(list) 的 HtoD 拷贝（profiler 显示每步 ~477 次）。
-        # 大小按"单请求最大页数"预留（max_seq_len / block_size），而非
-        # 池子总块数——一个请求不可能用完全部池子，避免过度预留。
+        # 常驻 2D 块表的行视图：pool.block_table_2d[row_id]（GPU 常驻，同步维护）。
+        # kernel / update 直接读它，避免每层组装 (B, max_pages) 的 HtoD/D2D
+        # 拷贝（profiler 显示批路径每层 zeros + B 次行拷贝 + seq_len HtoD）。
+        self.row_id = pool.alloc_row()
         max_pages = (pool.max_seq_len + pool.block_size - 1) // pool.block_size
-        self.block_table_tensor = torch.full(
-            (max_pages,), -1, dtype=torch.int32,
-            device=pool.k_buffer.device)
+        self.block_table_tensor = pool.block_table_2d[self.row_id]  # (max_pages,) 行视图
         self.num_pages = 0       # 当前已分配的页数（与 len(block_table) 同步）
 
     def _allocate_block(self):
@@ -95,8 +148,21 @@ class PagedKVCache:
             f"请求超过 max_seq_len（{self._pool.max_seq_len} tokens / {max_pages} 页）"
         new = self._pool.alloc(1)
         self.block_table.append(new[0])
-        self.block_table_tensor[self.num_pages] = new[0]   # GPU 张量同步写
+        self.block_table_tensor[self.num_pages] = new[0]   # 行视图 → 常驻 2D 表同步写
         self.num_pages += 1
+
+
+    def reserve_next(self):
+        """decode 步前预留页：本步将写 1 个新 token，若跨页边界则先申请。
+
+        页分配从层循环内（旧 update 每层可能分配）提前到每步一次：
+        申请后本步 28 层的块表完全稳定，update_kv_batch 只做纯 GPU 写入。
+        条件推导：write_pos = seq_len，所需页 = ceil((seq_len+1)/16)；
+        页已存在 iff num_pages >= ceil((seq_len+1)/16)。仅在不足时申请。
+        """
+        need = (self.seq_len + 1 + self._pool.block_size - 1) // self._pool.block_size
+        if need > self.num_pages:
+            self._allocate_block()
 
     def get_kv(self, layer_idx: int):
         """读取该层已缓存的所有 K, V"""
@@ -152,11 +218,14 @@ class PagedKVCache:
 
     def advance_seq_len(self, n: int = 1):
         self.seq_len += n
+        # GPU 常驻 seq_len 同步（decode kernel / update_kv_batch 的数据源）
+        self._pool.seq_lens[self.row_id] = self.seq_len
 
     def free(self):
-        """归还所有物理块到共享池"""
+        """归还所有物理块到共享池 + 归还常驻表行号"""
         if self.block_table:
             self._pool.free(self.block_table)
             self.block_table = []
             self.num_pages = 0      # GPU 张量内容无需清零（只读前 num_pages 项）
         self.seq_len = 0
+        self._pool.free_row(self.row_id)

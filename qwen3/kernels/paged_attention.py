@@ -29,13 +29,14 @@ def paged_attn_decode_kernel(
     q_ptr,               # (B, num_heads, head_dim) bf16
     k_buffer_ptr,        # (num_blocks, num_kv_heads, block_size, head_dim) bf16
     v_buffer_ptr,        # (num_blocks, num_kv_heads, block_size, head_dim) bf16
-    block_table_ptr,     # (B, max_pages) int32
-    seq_len_ptr,         # (B,) int32
+    block_table_ptr,     # (max_requests, max_pages) int32 GPU 常驻 2D 块表
+    seq_lens_ptr,        # (max_requests,) int32 GPU 常驻 seq_len
+    row_ids_ptr,         # (B,) int32 本批各请求的行号
     out_ptr,             # (B, num_heads, head_dim) bf16
     stride_q_b, stride_q_h, stride_q_d,
     stride_kb_blk, stride_kb_h, stride_kb_p, stride_kb_d,
     stride_vb_blk, stride_vb_h, stride_vb_p, stride_vb_d,
-    stride_bt_b, stride_bt_pg,
+    stride_bt_row, stride_bt_pg,
     stride_o_b, stride_o_h, stride_o_d,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -49,7 +50,9 @@ def paged_attn_decode_kernel(
     b = pid // num_kv_heads       # batch 索引
     hkv = pid % num_kv_heads      # KV 头索引
 
-    L = tl.load(seq_len_ptr + b).to(tl.int32)   # 标量：本请求有效 token 数（含新 token）
+    # 常驻表寻址：行号 → 本请求的 seq_len（含新 token）与块表行
+    row = tl.load(row_ids_ptr + b).to(tl.int32)     # 标量：常驻 2D 表中的行号
+    L = tl.load(seq_lens_ptr + row).to(tl.int32) + 1  # 标量：有效 token 数（含刚写入的新 token）
     num_pages = tl.maximum(0, (L + block_size - 1) // block_size)   # 标量：本请求页数
 
     offs_g = tl.arange(0, BLOCK_G)        # (BLOCK_G=16,) 行 tile 固定 16 行，多余行算完丢弃
@@ -72,8 +75,8 @@ def paged_attn_decode_kernel(
 
     for pg in range(num_pages):
         page_id = tl.load(
-            block_table_ptr + b * stride_bt_b + pg * stride_bt_pg
-        ).to(tl.int64)    # 标量：逻辑页 pg → 物理页号
+            block_table_ptr + row * stride_bt_row + pg * stride_bt_pg
+        ).to(tl.int64)    # 标量：逻辑页 pg → 物理页号（常驻表行内寻址）
 
         valid = tl.minimum(block_size, L - pg * block_size)       # 标量：本页有效 token 数
         token_mask = offs_p < valid                               # (block_size,) 布尔
@@ -126,7 +129,8 @@ def paged_attn_decode_kernel(
     )
 
 
-def paged_attention_decode_triton(q, k_buffer, v_buffer, block_table, seq_len, block_size):
+def paged_attention_decode_triton(q, k_buffer, v_buffer, block_table_2d,
+                                  seq_lens_full, row_ids, block_size):
     """裸 kernel 入口：把 (B, num_heads, head_dim) 的 q 和分页数据喂给 Triton kernel
 
     Args（维度说明）:
@@ -136,16 +140,17 @@ def paged_attention_decode_triton(q, k_buffer, v_buffer, block_table, seq_len, b
                     当前层的 K 物理页（pool.k_buffer[:, layer_idx] 的视图）
         v_buffer:   (num_blocks, num_kv_heads, block_size, head_dim) bf16
                     当前层的 V 物理页
-        block_table:(B, max_pages) int32
-                    每行一个请求的逻辑页表（物理页号），右 pad 0
-        seq_len:    (B,) int32
-                    每请求有效 token 数（含刚写入的新 token）
+        block_table_2d: (max_requests, max_pages) int32 GPU 常驻 2D 块表
+                    每行一个请求的页表（物理页号）；kernel 按 row_ids 行寻址
+        seq_lens_full:  (max_requests,) int32 GPU 常驻 seq_len（不含新 token）
+        row_ids:    (B,) int32 本批各请求的行号（每步组装一次，层循环共享）
         block_size: 标量，每块含多少个 token（16）
     Returns:
         out:        (B, num_heads, head_dim) bf16，kernel 输出（与 q 同形状）
 
     流程：grid = (B × num_kv_heads,) 个 program，
-    每个 program 处理一个 (b, hkv)，按 block_table[b, pg] 定位物理页逐页计算。
+    每个 program 处理一个 (b, hkv)，按 block_table_2d[row_ids[b], pg]
+    定位物理页逐页计算。
     """
     B, num_heads, head_dim = q.shape
     num_blocks, num_kv_heads, block_size_check, head_dim_check = k_buffer.shape
@@ -160,11 +165,11 @@ def paged_attention_decode_triton(q, k_buffer, v_buffer, block_table, seq_len, b
     grid = (B * num_kv_heads,)                     # 一维网格：B 请求 × Hkv 头
 
     paged_attn_decode_kernel[grid](
-        q, k_buffer, v_buffer, block_table, seq_len, out,
+        q, k_buffer, v_buffer, block_table_2d, seq_lens_full, row_ids, out,
         q.stride(0), q.stride(1), q.stride(2),
         k_buffer.stride(0), k_buffer.stride(1), k_buffer.stride(2), k_buffer.stride(3),
         v_buffer.stride(0), v_buffer.stride(1), v_buffer.stride(2), v_buffer.stride(3),
-        block_table.stride(0), block_table.stride(1),
+        block_table_2d.stride(0), block_table_2d.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
         num_heads, num_kv_heads, head_dim, block_size, num_kv_groups, BLOCK_G, scaling,
         num_warps=2,
@@ -193,30 +198,29 @@ def triton_paged_attention_decode(q, k_new, v_new, kv_cache, layer_idx, scaling)
     assert q.shape[2] == 1, "Triton kernel 仅支持 decode（S == 1）"
     assert q.dtype == torch.bfloat16, "Triton kernel 仅支持 bf16"
 
-    # 1. 先把本步新 token 的 K/V 写入物理页（页满自动申请）
-    #    k_new 形状 (1, Hkv, 1, D) 直接满足 update 的 (B, Hkv, S_new, D) 契约
-    kv_cache.update(layer_idx, k_new, v_new)
+    # 1. 先把本步新 token 的 K/V 写入物理页（页已由模型层循环外 reserve_next 预留）
+    #    k_new 形状 (1, Hkv, 1, D) 直接满足 update_kv_batch 的 (B, Hkv, S_new, D) 契约
+    pool = kv_cache._pool
+    row_ids = torch.tensor([kv_cache.row_id], dtype=torch.int32, device=q.device)  # (1,)
+    pool.update_kv_batch(layer_idx, k_new, v_new, row_ids)
 
     # 2. 组装 kernel 输入（pool 是按层存的，取当前层视图）
-    pool = kv_cache._pool
     k_buffer = pool.k_buffer[:, layer_idx]   # (num_blocks, num_kv_heads, block_size, head_dim)
     v_buffer = pool.v_buffer[:, layer_idx]   # 同上
 
-    # 块表：直接切 GPU 常驻张量（PagedKVCache 已同步维护，零 HtoD 拷贝）  张量切片 零开销
-    block_table = kv_cache.block_table_tensor[:kv_cache.num_pages].unsqueeze(0)  # (1, num_pages)
-    # seq_len 包含刚写入的新 token（旧缓存长度 + 1）
-    seq_len = torch.tensor([kv_cache.seq_len + 1], dtype=torch.int32, device=q.device)  # (1,)
-
     # 3. 跑 kernel（q 去掉 S 维：(B, H, 1, D) → (B, H, D)）
+    #    块表/seq_len 全部走池内常驻张量（block_table_2d / seq_lens），零组装零 HtoD
     out = paged_attention_decode_triton(
-        q.squeeze(2), k_buffer, v_buffer, block_table, seq_len, pool.block_size)
+        q.squeeze(2), k_buffer, v_buffer, pool.block_table_2d, pool.seq_lens,
+        row_ids, pool.block_size)
 
     # 4. 还原为 (B, 1, hidden) 给 o_proj
     B, num_heads, head_dim = q.shape[0], q.shape[1], q.shape[3]
     return out.reshape(B, 1, num_heads * head_dim)
 
 
-def triton_paged_attention_decode_batch(q, k_new, v_new, kv_caches, layer_idx, scaling):
+def triton_paged_attention_decode_batch(q, k_new, v_new, kv_caches, layer_idx, scaling,
+                                        row_ids=None):
     """批量 decode 入口：B 个请求一次 kernel（continuous batching 核心路径）
 
     Args（维度说明）:
@@ -226,62 +230,59 @@ def triton_paged_attention_decode_batch(q, k_new, v_new, kv_caches, layer_idx, s
         kv_caches: list[PagedKVCache]，长度 == B，每个请求自己的句柄
         layer_idx: 当前层号
         scaling: head_dim ** -0.5
+        row_ids: (B,) int32 GPU 常驻 2D 块表的行号（model.py 每步组装一次，
+                 28 层共享；None = 直接调用兜底，本函数内组装）
     Returns:
         attn_output: (B, 1, num_heads * head_dim)，尚未过 o_proj
 
     与单请求版的关系：单请求只是 B=1 的特例。kernel 本体按
-    (B, num_kv_heads) 网格 + 2D 块表设计，天然支持批量；
-    这里只负责把 B 个请求的块表拼成 (B, max_pages) 并右 pad。
+    (B, num_kv_heads) 网格 + 2D 块表行号寻址设计，天然支持批量。
 
     为什么"一次 kernel 吃 B 个请求"是吞吐关键：
       单请求 decode 时 kernel grid = 1×Hkv = 8 个 program，A100 108 个 SM
       利用率 <8%；批场景 grid = B×Hkv，B=64 时 512 个 program，SM 吃饱。
       分页/Triton 的开销靠并发摊薄——这正是 continuous batching 的意义。
+
+    常驻化改造（本层内只剩 3 件事，全部纯 GPU）：
+      ① 批量写 K/V（pool.update_kv_batch，一次 advanced indexing）
+      ② kernel 启动（块表/seq_len 直接引用池内常驻张量）
+      旧版每层要做：B 次 Python update 循环 + torch.zeros(B, max_pages)
+      + B 次行拷贝 + seq_len 的 HtoD —— 全部删除。
     """
     assert q.shape[2] == 1, "Triton kernel 仅支持 decode（S == 1）"
     assert q.dtype == torch.bfloat16, "Triton kernel 仅支持 bf16"
     B = q.shape[0]                               # 批大小（请求数）
     assert len(kv_caches) == B, "kv_caches 数量必须等于 batch"
 
-    # ---- 1. 逐请求写入新 token 的 K/V（B-loop）----
-    #    每个请求的 K/V 写进自己的块表（页写满自动从池申请新块）。
-    #    注意顺序：必须先 update 再收集块表——页满时 update 会使块表变长，
-    #    先写才能拿到真实块表（否则第 2 步拼的 (B, max_pages) 会漏掉新页）。
-    #    切 k_new[i:i+1] 保留 batch 维：k_new[i] 是 (Hkv, 1, D) 丢掉批维，
-    #    而 update 要求 (B=1, Hkv, S_new=1, D)，所以必须切片而不是取下标。
-    for i, c in enumerate(kv_caches):
-        c.update(layer_idx, k_new[i:i + 1], v_new[i:i + 1])
+    if row_ids is None:
+        # 兜底（未走 model.py 层循环外预组装）：本层内同步页表 + 行号。
+        # 注意：不能重复 reserve（model.py 已预留时再调会多申请一页），
+        # 兜底路径只出现在直接调用本函数的场景（测试/教学）。
+        for c in kv_caches:
+            c.reserve_next()
+        row_ids = torch.tensor([c.row_id for c in kv_caches],
+                               dtype=torch.int32, device=q.device)
 
-    # ---- 2. 组装 2D 块表: (B, max_pages) int32，右 pad 0 ----
-    #    kernel 需要矩形张量，但各请求页数不同（seq_len 不同）→ 右 pad 0。
-    #    安全：kernel 每请求只循环 ceil(seq_len/block_size) 页（运行时边界），
-    #    pad 的列永远不会被读到——与 model.py 的 mask 补列同一哲学。
-    #    数据来源：各请求的 GPU 常驻块表张量（PagedKVCache 同步维护），
-    #    切片拷进第 i 行 —— GPU→GPU 拷贝，零 HtoD（之前每层 torch.tensor(list)）。
     pool = kv_caches[0]._pool                    # 共享全局池（所有请求同一实例）
-    max_pages = max(c.num_pages for c in kv_caches)   # 批内最长页表
-    block_table = torch.zeros(B, max_pages, dtype=torch.int32, device=q.device)  # (B, max_pages)
-    for i, c in enumerate(kv_caches):
-        if c.num_pages:
-            block_table[i, :c.num_pages] = c.block_table_tensor[:c.num_pages]
 
-    # ---- 3. 批内各请求的 seq_len: (B,) int32 ----
-    #    kernel 每请求用它算 num_pages 和尾页 valid mask。
-    #    seq_len + 1：update 已写入新 token，所以有效长度 = 旧缓存 + 1。
-    seq_len = torch.tensor([c.seq_len + 1 for c in kv_caches],
-                           dtype=torch.int32, device=q.device)   # (B,)
+    # ---- 1. 批量写新 token 的 K/V（纯 GPU，一次写入 B 个请求）----
+    #    write_pos 直接来自常驻 seq_lens[row_ids]，物理页从常驻块表 gather，
+    #    不需要 Python 循环、不需要查 num_pages——reserve_next 已保证页存在。
+    pool.update_kv_batch(layer_idx, k_new, v_new, row_ids)
 
-    # ---- 4. 跑 kernel（q 去掉 S 维：(B, H, 1, D) → (B, H, D)）----
+    # ---- 2. 跑 kernel（q 去掉 S 维：(B, H, 1, D) → (B, H, D)）----
     #    k_buffer[:, layer_idx] 取当前层的物理页视图
     #    (num_blocks, num_layers, Hkv, block_size, D) → (num_blocks, Hkv, block_size, D)
     #    pool 是所有请求共享的——kernel 通过每行块表定位各请求的物理页，
     #    请求之间物理上共存于同一池，逻辑上互不可见（块表隔离）。
+    k_buffer = pool.k_buffer[:, layer_idx]
+    v_buffer = pool.v_buffer[:, layer_idx]
     out = paged_attention_decode_triton(
-        q.squeeze(2), pool.k_buffer[:, layer_idx], pool.v_buffer[:, layer_idx],
-        block_table, seq_len, pool.block_size)
+        q.squeeze(2), k_buffer, v_buffer, pool.block_table_2d, pool.seq_lens,
+        row_ids, pool.block_size)
     # out: (B, num_heads, head_dim)
 
-    # ---- 5. 还原为 (B, 1, hidden) 给 o_proj ----
+    # ---- 3. 还原为 (B, 1, hidden) 给 o_proj ----
     #    kernel 输出 (B, H, D) → reshape 成 (B, 1, H*D)
     #    与单请求版接口一致（o_proj 期望 (B, S, hidden)，decode 时 S=1）
     num_heads, head_dim = q.shape[1], q.shape[3]

@@ -393,18 +393,19 @@ def main():
         print(f"  {'-' * 60} {'-' * 10}  {'-' * 6}  {'-' * 8}")
 
         events = prof.key_averages()
-        total_cuda = sum(e.cuda_time_total for e in events if e.cuda_time_total > 0)
+        time_attr = "device_time_total" if hasattr(events[0], "device_time_total") else "cuda_time_total"
+        total_cuda = sum(getattr(e, time_attr) for e in events if getattr(e, time_attr) > 0)
 
         for i, e in enumerate(
-            sorted(events, key=lambda e: e.cuda_time_total, reverse=True)
+            sorted(events, key=lambda e: getattr(e, time_attr), reverse=True)
         ):
             if i >= 25:
                 break
-            if e.cuda_time_total == 0:
+            if getattr(e, time_attr) == 0:
                 break
-            pct = e.cuda_time_total / total_cuda * 100 if total_cuda > 0 else 0
+            pct = getattr(e, time_attr) / total_cuda * 100 if total_cuda > 0 else 0
             name = e.key[:58] + ".." if len(e.key) > 60 else e.key
-            print(f"  {name:<60} {e.cuda_time_total / 1000:>10.3f}  {pct:>5.1f}%  {e.count:>8}")
+            print(f"  {name:<60} {getattr(e, time_attr) / 1000:>10.3f}  {pct:>5.1f}%  {e.count:>8}")
 
         # --- 按算子类型分组（table 输出） ---
         print(f"\n  Operator type breakdown:")
