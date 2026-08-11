@@ -13,6 +13,7 @@
 """
 
 import torch
+from .kernels.paged_attention import update_kv_batch_triton
 
 
 class KVCachePool:
@@ -97,24 +98,20 @@ class KVCachePool:
 
     def update_kv_batch(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor,
                         row_ids: torch.Tensor):
-        """批量写 K/V（decode 批，纯 GPU，一次 kernel 写 B 个请求各 1 token）
+        """批量写 K/V（decode 批，纯 GPU，一次 Triton kernel 写 B 个请求各 1 token）
 
         k_new, v_new: (B, num_kv_heads, 1, head_dim)
         row_ids:      (B,) int32，各请求在常驻 2D 块表中的行号
 
         前提：本步已在层循环外 reserve_next()（页表已就绪），此处不做分配。
-        与旧版逐请求 Python 循环 update() 的区别：write_pos/物理页全部用
-        GPU gather（seq_lens[row_ids] / block_table_2d[row_ids, block_idx]），
-        B 个请求合并成一次 advanced-indexing 写入。
+        实现：Triton kernel（grid = B×num_kv_heads）一次 launch 同时写 K 和 V，
+        替代 PyTorch advanced indexing（每层 2 次 index_elementwise + 中间地址计算）。
         """
-        write_pos = self.seq_lens[row_ids]              # (B,) 各请求当前 seq_len
-        block_idx = write_pos // self.block_size        # (B,) 逻辑页
-        offset = write_pos % self.block_size            # (B,) 页内偏移
-        phys_ids = self.block_table_2d[row_ids, block_idx]  # (B,) 物理页号（GPU gather）
-
-        # k_new (B, Hkv, 1, D) → (B, Hkv, D)；左式 (B, Hkv, D)（advanced indexing）
-        self.k_buffer[phys_ids, layer_idx, :, offset] = k_new.squeeze(2)
-        self.v_buffer[phys_ids, layer_idx, :, offset] = v_new.squeeze(2)
+        k_in = k_new.squeeze(2)                          # (B, Hkv, D)
+        v_in = v_new.squeeze(2)
+        update_kv_batch_triton(
+            k_in, v_in, self.k_buffer, self.v_buffer,
+            self.seq_lens, self.block_table_2d, row_ids, layer_idx)
 
 
 class PagedKVCache:
