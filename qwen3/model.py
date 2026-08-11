@@ -132,18 +132,30 @@ class Qwen3Model(nn.Module):
                 if l_i < S:
                     position_ids[i, l_i:] = 0
 
-            row = torch.arange(S, device=input_ids.device).view(1, S, 1)       # (1, S, 1)
-            col = torch.arange(S, device=input_ids.device).view(1, 1, S)      # (1, 1, S)
-            lens_t = torch.tensor(lens, device=input_ids.device).view(B, 1, 1)  # (B, 1, 1)
-            # 有效区域: 行/列都在自己长度内 + 因果（col <= row）
-            valid = (row < lens_t) & (col < lens_t) & (col <= row)
-            # pad 行留第 0 列可见，防止整行 -inf → softmax NaN
-            pad_keep = (row >= lens_t) & (col == 0)
-            causal_mask = torch.full((B, S, S), float("-inf"),
-                                     device=input_ids.device,
-                                     dtype=hidden_states.dtype)
-            causal_mask[valid | pad_keep] = 0
-            causal_mask = causal_mask.unsqueeze(1)   # (B, 1, S, S)
+            # ---- ③ mask：仅标准 attention 兜底需要 ----
+            # prefill 走 flash（QWEN3_FLASH_ATTN=triton 且 GPU）时，varlen kernel
+            # 用 cu_seqlens 在 kernel 内处理 causal + 逐请求隔离，不需要 4D mask
+            # （与 attention.py 的 use_flash 判断保持一致）→ 直接传 None，省掉
+            # (B,1,S,S) 构造的 index_elementwise 开销。仅 standard 兜底需构造。
+            use_flash = (
+                input_ids.is_cuda
+                and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
+            )
+            if use_flash:
+                causal_mask = None
+            else:
+                row = torch.arange(S, device=input_ids.device).view(1, S, 1)       # (1, S, 1)
+                col = torch.arange(S, device=input_ids.device).view(1, 1, S)      # (1, 1, S)
+                lens_t = torch.tensor(lens, device=input_ids.device).view(B, 1, 1)  # (B, 1, 1)
+                # 有效区域: 行/列都在自己长度内 + 因果（col <= row）
+                valid = (row < lens_t) & (col < lens_t) & (col <= row)
+                # pad 行留第 0 列可见，防止整行 -inf → softmax NaN
+                pad_keep = (row >= lens_t) & (col == 0)
+                causal_mask = torch.full((B, S, S), float("-inf"),
+                                         device=input_ids.device,
+                                         dtype=hidden_states.dtype)
+                causal_mask[valid | pad_keep] = 0
+                causal_mask = causal_mask.unsqueeze(1)   # (B, 1, S, S)
 
         # 提前计算 RoPE cos/sin（position_ids 已是逐请求独立的）
         position_embeddings = self.rotary_emb(position_ids)
