@@ -35,13 +35,15 @@ v0.2  PagedKVCache（存储层分页：共享池 + 块表，计算仍标准 atte
 v1.0  PagedAttention（计算层分页：Triton decode kernel + dtype 修复）
 v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正）
 v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4）
-v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel，当前）
+v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel）
+v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
 - **v1.x = PagedAttention 时代**（计算也分页，主版本跨入 1.0）
 - **v2.x = Continuous Batching 时代**（多请求并发调度，吞吐量级提升）
 - **v2.1 起 = prefill 计算融合**（QKᵀ/softmax/PV 折叠进单个 Triton kernel）
+- **v2.2 = decode 工程流水线**（块表/seq_len GPU 常驻 + K/V 写入合并单 kernel，不引入新算法）
 
 ---
 
@@ -56,29 +58,30 @@ v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel，当前）
 | v1.0 | 3ec469b | Triton decode kernel + dtype 修复 | 27.16 | 34.6 | 864.6 | 2.06 |
 | v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
 | v2.1 | f3c2d40 | + flash prefill 融合 kernel | 29.27 | 34.1 | **35.3** | 2.06 |
+| v2.2 | 4c4aa2e | + GPU 常驻块表 + Triton K/V 写入 | **31.3** | **31.8** | **35.3** | 2.06 |
 
 > v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
-> 同环境重跑；v1.1 为当时版本实测；v2.1 为本次（2026-08，64 序列）实测。
+> 同环境重跑；v1.1 为当时版本实测；v2.1/v2.2 为本次（2026-08）实测。
 >
-> **注意**：v2.1 单请求串行下与 v1.1 基本持平（29.27 vs 29.58 tok/s）——
-> prefill 融合 kernel 的收益在**长 prompt / 大 batch**（N² 不物化防 OOM），
-> 单请求短序列下 decode 仍占 99.8% 墙钟，prefill 优化对整体吞吐无感
-> （详见 3.6/3.7 的专项剖析）。
+> **注意**：v2.1/v2.2 单请求串行下与 v1.1 基本持平（~29-31 vs 29.58 tok/s）——
+> prefill 融合与 decode 工程优化的收益在**大 batch / 并发**（批路径块表组装消失，
+> 吞吐 batch 8/16/28 = 194.6/330.8/513.7 tok/s）；单请求串行受限于
+> B=1 时 Triton grid 仅 8 个 program 的 SM 利用率 + CPU 提交（kernel 启动间隙），
+> decode 墙钟 38.6ms/步 vs GPU 纯算 14.8ms，详见 3.8。
 
 ### 2.2 连续批处理（bench_batched.py，GPU 空闲）
+
+v2.2 实测（64 序列，input [32,128], output [16,64], greedy）：
 
 | Mode | Batch | Throughput | Decode | Lat p50 | vs serial |
 |---|---|---|---|---|---|
 | serial | 1 | 28.1 tok/s | 34.7 ms/tok | - | 1.00x |
-| batched | 2 | 48.7 | 19.7 | - | 1.73x |
-| batched | 4 | 78.5 | 11.9 | - | 2.79x |
-| batched | 8 | 115.9 | 7.9 | - | 4.12x |
-| batched | 16 | 153.5 | 5.9 | - | 5.46x |
-| batched | **28** | **184.0** | **5.0** | - | **6.55x** |
-| batched | 32 | 188.1 | 4.9 | - | 6.69x |
+| batched | 8 | **194.6** | - | - | **6.93x** |
+| batched | 16 | **330.8** | - | - | **11.8x** |
+| batched | 28 | **513.7** | - | - | **18.3x** |
 
-> 2026-08 扫描（64 序列，input [32,128], output [16,64], greedy）。
-> 完整数据与拐点分析见 3.5 节。
+> 对比 v2.1（batch 8/16/28 = 115.9/153.5/184.0 tok/s）：v2.2 吞吐 +68%~+179%，
+> 峰值从 ~184 拉到 513+ tok/s——块表常驻消除了每层组装，CPU 提交不再是瓶颈。
 
 ### 2.3 关键发现
 
@@ -87,10 +90,10 @@ v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel，当前）
 2. **分页/Triton 的价值在并发**：开销靠 continuous batching 摊薄——这是做并发调度的动机。
 3. **prefill 优化收益最大**：v1.0 逐页 864.6ms → v1.1 标准 attention 35.0ms（-96%）。
 4. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），对速度无贡献（v1.0 vs v0.2 decode 相同）。
-5. **吞吐峰值拐点 ≈ batch 16-30**：batch 1→8 每 +1 batch 平均 +12.5 tok/s（SM 填满），
-   之后边际增益 <3 tok/s/batch；峰值 184-193 tok/s（batch 28-30），6.5x+ vs serial。
-6. **当前瓶颈在工程流水线**：decode 墙钟 82.7ms/步 vs GPU 纯算 30.0ms/步
-   （利用率 36%，kernel 启动间隙），详见 3.7。
+5. **吞吐拐点被 v2.2 改写**：块表常驻后 batch 8/16/28 达 194.6/330.8/513.7 tok/s，
+   吞吐仍随 batch 增长（CPU 组装不再是瓶颈），拐点推后——完整扫描见 3.8。
+6. **当前瓶颈仍在 CPU 提交**：decode 墙钟 39.9ms/步 vs GPU 纯算 16.6ms/步
+   （利用率 42%，kernel 启动间隙），详见 3.8。
 
 ---
 
@@ -369,6 +372,71 @@ attention forward
 - **prefill 已不是瓶颈**：flash 融合后单层 attention 3.68ms×28 次，
   已被投影 GEMM（~20ms）盖过；长 prompt 时 flash 收益显著且防 OOM。
 - **吞吐拐点 batch≈16-30**：最优工作点在 batch 24-28（172-184 tok/s, 6x+ vs serial）。
+
+### 3.8 v2.2 — decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入）
+
+> 基准：`profile_decode.py --mode decode`（batch=8）+ `bench_batched.py`（64 序列）
+> 提交：db8407b（块表常驻）+ 4c4aa2e（Triton update）
+> 定位：**不引入新算法**，纯工程流水线优化——消除批路径每层重复的块表组装杂活。
+
+#### 改动（两个提交）
+
+**db8407b — GPU-resident block table**
+- `KVCachePool` 新增 GPU 常驻 `block_table_2d (max_requests, max_pages)` + `seq_lens`
+  张量，请求按行槽位（row_id）管理（`alloc_row`/`free_row`）
+- `reserve_next`：decode 步在层循环外预留页，28 层内块表稳定；
+  修旧 bug（`seq_len%16==0` 在页已存在时仍重复分配）
+- `update_kv_batch`：B 请求 K/V 写入合并为一次 advanced indexing（纯 GPU）
+- `alloc` 复用已释放页清零（zero-initialized KV cache）
+
+**4c4aa2e — Triton update_kv_batch**
+- 新增 `update_kv_batch_kernel`（grid = B×num_kv_heads，每个 program 一次写 K+V）
+- 替代 PyTorch advanced indexing（每层 2 次 `index_elementwise` + 中间地址计算 → 1 次 launch）
+
+#### 实测对比（decode，batch=8，GPU 纯算）
+
+| 里程碑 | decode 总 CUDA 时间 | `index_elementwise` 调用 |
+|---|---|---|
+| v2.1（flash prefill 后） | 29.7-30.5 ms | 448 + 224 次 |
+| + 块表常驻（db8407b） | 19.1 ms | 56×2 次 |
+| + Triton update（4c4aa2e） | **16.6 ms** | **0 次** |
+
+**decode 墙钟 / 利用率**（batch=8，30 步均值）：
+
+| 指标 | v2.1 | v2.2 | 变化 |
+|---|---|---|---|
+| 墙钟 | 82.7 ms/步 | **39.9 ms/步** | **-52%** |
+| GPU 纯算 | 30.0 ms/步 | 16.6 ms/步 | -45% |
+| GPU 利用率 | 36% | **42%** | +6pp |
+| GPU 空等 CPU | ~53 ms | 23.3 ms | -56% |
+
+#### 吞吐（64 序列，v2.1 vs v2.2）
+
+| batch | v2.1 | v2.2 | 提升 |
+|---|---|---|---|
+| 8 | 115.9 tok/s | **194.6** | +68% |
+| 16 | 153.5 | **330.8** | +116% |
+| 28 | 184.0 | **513.7** | +179% |
+
+#### 收益归因
+
+- **块表组装消失**：批路径每层的 `torch.zeros + B 次行拷贝 + seq_len HtoD` 全部删除
+  （`index_elementwise` 448 次 → 0）
+- **K/V 写入合并**：每层 2 次 PyTorch scatter → 1 次 Triton launch（56×2 → 0 次
+  `index_elementwise`）
+- **CPU 提交减半**：墙钟 82.7→39.9ms，CPU 空等 53→23.3ms——工程杂活不再是
+  decode 的主要开销，kernel 启动间隙成为剩余瓶颈 → CUDA Graph 收益更大
+
+#### 正确性验证
+
+- 块表常驻 + Triton update 均与 PyTorch 逐位一致；GPU batch vs 串行逐 token 16/16 一致
+- `test_batched.py` 6 组场景全过
+
+#### 剩余瓶颈（下一 P0）
+
+decode 墙钟 39.9ms 里仍有 23.3ms 是 CPU 空等 GPU（kernel 启动间隙，~37 事件/步）。
+块表常驻削掉了组装杂活，但每层仍 ~37 次 kernel 启动。**CUDA Graph 捕获整步
+是下一个量级优化**（预期墙钟 39.9 → ~20ms，利用率 42% → 80%+）。
 
 ---
 

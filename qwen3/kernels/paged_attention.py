@@ -287,3 +287,81 @@ def triton_paged_attention_decode_batch(q, k_new, v_new, kv_caches, layer_idx, s
     #    与单请求版接口一致（o_proj 期望 (B, S, hidden)，decode 时 S=1）
     num_heads, head_dim = q.shape[1], q.shape[3]
     return out.reshape(B, 1, num_heads * head_dim)
+
+
+@triton.jit
+def update_kv_batch_kernel(
+    k_new_ptr,           # (B, num_kv_heads, head_dim) bf16（squeeze 后）
+    v_new_ptr,           # (B, num_kv_heads, head_dim) bf16
+    k_buffer_ptr,        # (num_blocks, num_layers, num_kv_heads, block_size, head_dim) bf16
+    v_buffer_ptr,        # 同上
+    seq_lens_ptr,        # (max_requests,) int32 GPU 常驻
+    block_table_2d_ptr,  # (max_requests, max_pages) int32 GPU 常驻 2D 块表
+    row_ids_ptr,         # (B,) int32 本批各请求的行号
+    layer_idx,           # 当前层号（运行时标量）
+    stride_kb_blk, stride_kb_lyr, stride_kb_h, stride_kb_p, stride_kb_d,
+    stride_vb_blk, stride_vb_lyr, stride_vb_h, stride_vb_p, stride_vb_d,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_pages: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Triton 批量写 K/V：grid = (B * num_kv_heads,)
+
+    每个 program 处理一个 (b, hkv)：
+      - 用 row_ids[b] 从常驻 seq_lens 取 write_pos，从常驻块表取物理页
+      - 一次 kernel 同时把该 (b,hkv) 的 K 和 V 写进 k_buffer / v_buffer
+    替代 PyTorch advanced indexing（每层 2 次 index_elementwise → 1 次 launch）。
+    """
+    pid = tl.program_id(0)
+    b = pid // num_kv_heads
+    hkv = pid % num_kv_heads
+
+    row = tl.load(row_ids_ptr + b)
+    write_pos = tl.load(seq_lens_ptr + row).to(tl.int64)
+    block_idx = write_pos // block_size
+    offset = write_pos % block_size
+    phys = tl.load(block_table_2d_ptr + row * max_pages + block_idx).to(tl.int64)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_d = offs_d < head_dim
+
+    # k_new (B, Hkv, D) → 本 program 的 (D,)
+    k_in = tl.load(k_new_ptr + b * num_kv_heads * head_dim + hkv * head_dim + offs_d,
+                   mask=mask_d, other=0.0)
+    v_in = tl.load(v_new_ptr + b * num_kv_heads * head_dim + hkv * head_dim + offs_d,
+                   mask=mask_d, other=0.0)
+
+    # k_buffer 布局: (num_blocks, num_layers, num_kv_heads, block_size, head_dim)
+    k_off = (phys * stride_kb_blk + layer_idx * stride_kb_lyr
+             + hkv * stride_kb_h + offset * stride_kb_p + offs_d)
+    v_off = (phys * stride_vb_blk + layer_idx * stride_vb_lyr
+             + hkv * stride_vb_h + offset * stride_vb_p + offs_d)
+
+    tl.store(k_buffer_ptr + k_off, k_in, mask=mask_d)
+    tl.store(v_buffer_ptr + v_off, v_in, mask=mask_d)
+
+
+def update_kv_batch_triton(k_new, v_new, k_buffer, v_buffer, seq_lens,
+                           block_table_2d, row_ids, layer_idx):
+    """Triton 批量写 K/V 的 host wrapper
+
+    k_new, v_new: (B, num_kv_heads, head_dim) bf16（已 squeeze 掉 S=1 维）
+    返回: None（就地写入 pool 的 k_buffer / v_buffer）
+    """
+    B, num_kv_heads, head_dim = k_new.shape
+    num_blocks, num_layers, _, block_size, _ = k_buffer.shape
+    max_pages = block_table_2d.shape[1]
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (B * num_kv_heads,)
+    update_kv_batch_kernel[grid](
+        k_new, v_new, k_buffer, v_buffer, seq_lens, block_table_2d, row_ids,
+        layer_idx,
+        k_buffer.stride(0), k_buffer.stride(1), k_buffer.stride(2),
+        k_buffer.stride(3), k_buffer.stride(4),
+        v_buffer.stride(0), v_buffer.stride(1), v_buffer.stride(2),
+        v_buffer.stride(3), v_buffer.stride(4),
+        num_kv_heads=num_kv_heads, head_dim=head_dim, block_size=block_size,
+        max_pages=max_pages, BLOCK_D=BLOCK_D,
+    )
