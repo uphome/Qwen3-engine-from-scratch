@@ -135,17 +135,16 @@ class Qwen3Attention(nn.Module):
                 attn_output = triton_paged_attention_decode_batch(
                     q, k, v, caches, layer_idx, self.scaling, row_ids)
             elif S > 1 or caches[0].seq_len == 0:
-                # ---- prefill 批：批量写页 + 批 matmul 标准 attention ----
+                # ---- prefill 批：B-loop 写页 + 批 matmul 标准 attention ----
                 # 条件 S>1 或 seq_len==0：1-token prompt 的 prefill 也是 S=1，
                 #   不能误走 decode 兜底（逐请求 paged_attention），
                 #   否则状态错乱导致后续 decode 崩
-                # ① 批量写页（一次 scatter 写全部请求，替代旧 B-loop 的
-                #    28 层 × B 次 Python 循环 + 小 kernel 启动）
+                # ① 逐请求写页（B-loop）：正确性优先。各请求块表长度不同，
+                #    真 batched update 需要拼接批量写入，留作后续优化
                 # ② 标准 attention 是批的：q/k/v 都是 (B, H, S, D)，
                 #    matmul 一次算 B 个请求（大矩阵吃满 cuBLAS）——性能关键在这
-                lens = input_lens if input_lens is not None else [S] * B
-                pool = caches[0]._pool
-                pool.update_kv_batch_prefill(layer_idx, k, v, caches, lens)
+                for i, c in enumerate(caches):
+                    c.update(layer_idx, k[i:i + 1], v[i:i + 1])
                 use_flash = (
                     q.is_cuda
                     and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
@@ -153,6 +152,7 @@ class Qwen3Attention(nn.Module):
                 if use_flash:
                     # vLLM 风格 varlen flash attention：内核内 GQA + 变长，
                     # 不需要 repeat_kv / 4D mask，lens 给出各请求有效长度
+                    lens = input_lens if input_lens is not None else [S] * B
                     attn_output = flash_attention_prefill_batched(
                         q, k, v, lens, self.scaling,
                         self.num_heads, self.num_kv_heads, self.head_dim)
