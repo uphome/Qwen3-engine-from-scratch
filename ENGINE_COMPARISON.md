@@ -124,10 +124,10 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）
 | v1.0 Triton decode | 34.6 | 864.6 | 27.16 | 2.06 GB |
 | v1.1 标准 prefill | 33.7 | 35.0 | 29.58 | 2.06 GB |
 | v2.2 无图 | 31.8 | 35.3 | 31.3 | 2.06 GB |
-| v3.0 串行（无图） | 32.0 | 35.5 | 31.18 | 2.06 GB |
+| **v3.0 CUDA Graph** | **7.3** | **35.6** | **129.82** | **2.06 GB** |
 
-（bench.py 串行不走 CUDA Graph——图只集成在 bench_batched 的 decode 步；
-batch=1 图路径见 3.2：31.1 → 6.3 ms/tok，5x）
+（v3.0 起 generate() 也走图——main.py/bench.py 默认开，--no-graph 关闭；
+串行 decode 32.0 → 7.3 ms/tok，4.2x；图路径单请求走批 kernel）
 
 ### 3.2 连续批处理（bench_batched.py，64 序列，GPU 空闲）
 
