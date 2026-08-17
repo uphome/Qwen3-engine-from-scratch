@@ -19,7 +19,7 @@
 - [x] KV 块清零（alloc 复用页清零，zero-initialized KV cache，v2.2）
 - [x] K/V 写入合并为 Triton 单 kernel（update_kv_batch_kernel，v2.2）
 - [x] batch 16/32 扫描找吞吐拐点（v2.2 后 batch 8/16/28 = 194.6/330.8/513.7 tok/s）
-- [x] CUDA Graph decode（GraphRunner 图池，2 的幂 bucket + 哑行占位，v2.3）
+- [x] CUDA Graph decode（GraphRunner 图池，2 的幂 bucket + 哑行占位，v3.0）
 - [x] 批路径 decode 跳过 mask/position 构造（Triton 路径本就 None）
 
 ### 工程流水线（P0，收益最大）
@@ -58,7 +58,7 @@
 ├─────────────────────────────────────────────────────────┤
 │  计算层  三段式 attention                                  │
 │    prefill  → varlen FlashAttention（cu_seqlens 变长）     │
-│    decode   → CUDA Graph（GraphRunner 图池，v2.3）          │
+│    decode   → CUDA Graph（GraphRunner 图池，v3.0）          │
 │                ├ 图内: Triton decode + Triton update        │
 │                └ 图外: reserve/advance/pos/rows（驱动循环） │
 │    兜底     → PyTorch 逐页版（CPU/非 bf16）                │
@@ -69,7 +69,7 @@
 
 **已具备的工业级骨架**：共享池 + 常驻块表 + 请求级句柄、状态机校验、
 防饥饿调度、KV 块归还复用 + 清零、连续批处理（batch_size 可扫）、
-prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v2.3）。
+prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）。
 
 ---
 
@@ -92,7 +92,7 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v2.3）
 |---|---|---|---|
 | decode kernel | Triton，grid = B×Hkv，页循环串行 | CUDA，split-K 页并行 + warp 级优化 | 长上下文时 SM 利用率低 |
 | prefill kernel | varlen FlashAttention（v2.1 融合） | FlashAttention-2/3（更优 tiling） | 已融合，仍有优化空间 |
-| CUDA Graph | ✅ GraphRunner 图池，decode 步零 Python 启动（v2.3） | ✅ 整步捕获成图，replay 单次启动 | **已对齐**：decode 墙钟 ~40 → 2ms 量级（batch=8） |
+| CUDA Graph | ✅ GraphRunner 图池，decode 步零 Python 启动（v3.0） | ✅ 整步捕获成图，replay 单次启动 | **已对齐**：decode 墙钟 ~40 → 2ms 量级（batch=8） |
 | KV 精度 | bf16 | fp8 KV cache（带宽减半） | 长上下文内存压力 |
 | 算子融合 | 无 | RMSNorm/RoPE 融合进 kernel | kernel 启动次数 |
 | 块表寻址 | ✅ GPU 常驻 2D 表 + row_id 行号寻址（v2.2） | GPU 常驻块表 / kernel 内寻址 | 已对齐 |
@@ -109,7 +109,7 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v2.3）
 
 ---
 
-## 3. 实测性能（当前结果，2026-08，v2.3）
+## 3. 实测性能（当前结果，2026-08，v3.0）
 
 > 环境：单卡 A100-40GB / CUDA 11.8 / PyTorch 2.2.2 / bf16 / 真实墙钟口径（synchronize）
 > 模型：Qwen3-0.6B（0.75B, 28 层, hidden=1024, Q heads=16, KV heads=8）
@@ -124,9 +124,9 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v2.3）
 | v1.0 Triton decode | 34.6 | 864.6 | 27.16 | 2.06 GB |
 | v1.1 标准 prefill | 33.7 | 35.0 | 29.58 | 2.06 GB |
 | v2.2 无图 | 31.8 | 35.3 | 31.3 | 2.06 GB |
-| **v2.3 CUDA Graph** | **5.9** | **35.3** | **~120** | **2.06 GB** |
+| **v3.0 CUDA Graph** | **5.9** | **35.3** | **~120** | **2.06 GB** |
 
-（v2.3 单请求 = batch=1 图：decode 31.1 → 5.9 ms/tok，5.3x）
+（v3.0 单请求 = batch=1 图：decode 31.1 → 5.9 ms/tok，5.3x）
 
 ### 3.2 连续批处理（bench_batched.py，64 序列，GPU 空闲）
 
@@ -136,16 +136,16 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v2.3）
 | batched (v2.2 无图) | 8 | 194.6 | ~19.1 ms/步 | 6.93x |
 | batched (v2.2 无图) | 16 | 330.8 | - | 11.8x |
 | batched (v2.2 无图) | 28 | 513.7 | - | 18.3x |
-| batched (v2.3 图) | 8 | **~630** | **0.9 ms/tok** | **~22x** |
-| batched (v2.3 图) | 16 | **~900** | **0.6 ms/tok** | **~30x** |
-| batched (v2.3 图) | 28 | **1308** | **0.4 ms/tok** | **41.8x** |
+| batched (v3.0 图) | 8 | **~630** | **0.9 ms/tok** | **~22x** |
+| batched (v3.0 图) | 16 | **~900** | **0.6 ms/tok** | **~30x** |
+| batched (v3.0 图) | 28 | **1308** | **0.4 ms/tok** | **41.8x** |
 
 CUDA Graph 收益（batch=28）：decode 16.6 → 0.4 ms/tok（~40x），
 吞吐 513.7 → 1308 tok/s（2.5x）；CPU 提交开销（每步 ~33 次启动）归零。
 
-### 3.3 瓶颈分析（batch=8，v2.3 图路径后 profile）
+### 3.3 瓶颈分析（batch=8，v3.0 图路径后 profile）
 
-| 指标 | v2.2 无图 | v2.3 图 | 说明 |
+| 指标 | v2.2 无图 | v3.0 图 | 说明 |
 |---|---|---|---|
 | 墙钟 | 39.9 ms/步 | ~2.0 ms/tok | CUDA Graph 消除 CPU 提交 |
 | GPU 纯 kernel | 16.6 ms/步 | ~0.9 ms/tok | 图内仍是同样 kernel，但零启动间隙 |
@@ -158,7 +158,7 @@ v2.2 时代 top kernel（每步）：
 - `update_kv_batch_kernel`: 0.16ms × 28（Triton K/V 写入，v2.2 新增）
 
 **关键结论**：块表常驻 + Triton update（v2.2）消除 `index_elementwise`（448→0 次），
-墙钟 91 → 39.9ms；CUDA Graph（v2.3）再消除 CPU 提交间隙（~23.3ms 空等），
+墙钟 91 → 39.9ms；CUDA Graph（v3.0）再消除 CPU 提交间隙（~23.3ms 空等），
 batch=8 decode 墙钟 ~40 → 2ms 量级。剩余瓶颈转向纯 GPU kernel 时间
 （权重带宽 0.75ms/步理论下限，当前 batch=28 已 0.4ms/tok < 单请求带宽下限，
 批并行已充分摊薄）。
@@ -191,8 +191,8 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
   - decode kernel 无 split-K / warp 优化
   - 无 chunked prefill / prefix caching
 
-工程层差距（v2.3 后已基本消除）:
-  - ✅ CUDA Graph：decode 步整图捕获，replay 单次启动（v2.3）
+工程层差距（v3.0 后已基本消除）:
+  - ✅ CUDA Graph：decode 步整图捕获，replay 单次启动（v3.0）
   - ✅ decode 批路径 mask/position 构造跳过（Triton 路径本就 None）
   - prefill 的 K/V 写入仍是 PyTorch（decode 已 Triton，prefill 未覆盖）
 ```
@@ -220,7 +220,7 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P3 | 换出 (swap) | 显存超卖 | 高 | [ ] |
 
 （已完成项见第 0 节：块表常驻 / 块表缓存 / KV 清零 / 吞吐拐点扫描 /
-prefill FlashAttention / Triton K/V 写入 / CUDA Graph——v2.1/v2.2/v2.3
+prefill FlashAttention / Triton K/V 写入 / CUDA Graph——v2.1/v2.2/v3.0
 均已落地。）
 
 ---
