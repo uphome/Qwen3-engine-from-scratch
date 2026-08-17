@@ -180,6 +180,35 @@ class Qwen3Model(nn.Module):
         # 最终归一化
         return self.norm(hidden_states)
 
+    def forward_decode(self, input_ids: torch.Tensor,
+                       position_embeddings: tuple[torch.Tensor, torch.Tensor],
+                       row_ids: torch.Tensor,
+                       caches: list) -> torch.Tensor:
+        """decode 步的"捕获友好"前向：纯 GPU 计算，零 Python 状态操作
+
+        与 forward() 的 decode 分支等价，但**所有动态/状态部分由调用方负责**：
+          - input_ids: (B, 1) 已含本步新 token（调用方 copy_ 进固定张量）
+          - position_embeddings: (cos, sin) 已按本步 start_pos 算好（调用方传）
+          - row_ids: (B,) 常驻 2D 块表行号（调用方组装）
+          - caches:   list[PagedKVCache]（长度 == B）
+
+        本函数内不做：reserve_next（页分配）、advance_seq_len（状态推进）、
+        position_ids 构造、row_ids 组装——这些都有 Python 循环/分配/状态，
+        是 CUDA Graph 捕获的禁区。调用方在 replay 前后处理。
+
+        为什么能进图：
+          - 层循环是 Python for，但每层只调固定形状的 GPU 算子（形状 B 恒定）
+          - 无 torch.empty / tensor 构造（全部中间量由算子内部分配，预热后
+            内存池稳定；唯一新增输出是每层的 hidden_states，形状固定）
+          - row_ids / position_embeddings 都是外部传入的固定张量
+        """
+        hidden_states = self.embed_tokens(input_ids)
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states, None, position_embeddings,
+                                  kv_cache=caches, layer_idx=i, input_lens=None,
+                                  row_ids=row_ids)
+        return self.norm(hidden_states)
+
 
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, config: Qwen3Config):
@@ -199,4 +228,17 @@ class Qwen3ForCausalLM(nn.Module):
         """
         hidden_states = self.model(input_ids, kv_cache=kv_cache,
                                    input_lens=input_lens)
+        return self.lm_head(hidden_states)
+
+    def forward_decode(self, input_ids: torch.Tensor,
+                       position_embeddings: tuple[torch.Tensor, torch.Tensor],
+                       row_ids: torch.Tensor,
+                       caches: list) -> torch.Tensor:
+        """decode 步捕获友好的完整前向（backbone + lm_head）——供 CUDA Graph 捕获
+
+        见 Qwen3Model.forward_decode 的说明：本函数零 Python 状态操作，
+        reserve/advance/position/row_ids 全由调用方负责。返回 (B, 1, vocab) logits。
+        """
+        hidden_states = self.model.forward_decode(
+            input_ids, position_embeddings, row_ids, caches)
         return self.lm_head(hidden_states)
