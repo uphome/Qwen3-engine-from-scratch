@@ -36,11 +36,14 @@ def generate(
     top_p: float = 0.9,
     eos_token_id: int = 151645,
     kv_cache_pool: KVCachePool | None = None,
+    graph_runner=None,
 ) -> tuple[torch.Tensor, dict]:
     """自回归生成 (有 KV cache)
 
     kv_cache_pool: 全局共享池（KVCachePool）。若为 None 则自动创建一个
                    本次请求专用的小池（不做跨请求复用）。
+    graph_runner:  GraphRunner | None。非 None 时 decode 步走 CUDA Graph
+                   （replay），prefill 步保持 eager（model 前向）。
     """
     generated = input_ids.clone()
     stats = {"step_times": [], "input_len": input_ids.shape[1]}
@@ -70,6 +73,22 @@ def generate(
             if step == 0:
                 # Prefill: 第一次送入完整 prompt，所有 K,V 写入 cache
                 logits = model(generated, kv_cache=kv_cache)
+            elif graph_runner is not None and input_ids.is_cuda:
+                # Decode 走 CUDA Graph：replay 替代 model 前向。
+                # 与 run_batched 的 decode 分支契约一致：reserve/advance
+                # 是 Python 状态操作，必须在图外（forward_decode 内零状态）。
+                kv_cache.reserve_next()          # 页预留（原 forward 内部做）
+                start_pos = kv_cache.seq_len     # 图外读（replay 前）
+                positions = torch.tensor([[start_pos]], dtype=torch.long,
+                                         device=input_ids.device)
+                cos, sin = model.model.rotary_emb(positions)
+                rows = torch.tensor([kv_cache.row_id], dtype=torch.int32,
+                                    device=input_ids.device)
+                logits = graph_runner.replay(
+                    generated[:, -1:], positions,
+                    cos.to(torch.bfloat16), sin.to(torch.bfloat16), rows)
+                logits = logits[:1]              # (b,1,vocab) → 前 k 行有效
+                kv_cache.advance_seq_len(1)      # 状态推进（原 forward 内部做）
             else:
                 # Decode: 只送入最后一个 token，其余 K,V 从 cache 读
                 logits = model(generated[:, -1:], kv_cache=kv_cache)

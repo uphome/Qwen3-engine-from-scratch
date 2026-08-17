@@ -66,18 +66,19 @@ v3.0  CUDA Graph decode（GraphRunner 图池，当前）
 | v1.0 | 3ec469b | Triton decode kernel + dtype 修复 | 27.16 | 34.6 | 864.6 | 2.06 |
 | v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
 | v2.1 | f3c2d40 | + flash prefill 融合 kernel | 29.27 | 34.1 | **35.3** | 2.06 |
-| v2.2 | 4c4aa2e | + GPU 常驻块表 + Triton K/V 写入 | **31.3** | **31.8** | **35.3** | 2.06 |
-| v3.0 | c1f94d5 | + CUDA Graph decode（串行路径无图，见注） | 31.18 | 32.0 | 35.5 | 2.06 |
+| v2.2 | 4c4aa2e | + GPU 常驻块表 + Triton K/V 写入 | 31.3 | 31.8 | **35.3** | 2.06 |
+| v3.0 | c1f94d5 | + CUDA Graph decode（串行也走图） | **129.82** | **7.3** | 35.6 | 2.06 |
 
 > v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
 > 同环境重跑；v1.1 为当时版本实测；v2.1/v2.2 为本次（2026-08）实测。
 >
-> **注意**：① bench.py 是串行 generate()，**不走 CUDA Graph**（图只集成在
-> bench_batched 的 decode 步），故 v3.0 串行与 v2.2 持平（31.18/32.0，实测）；
-> ② v2.1/v2.2 单请求串行下与 v1.1 基本持平（~29-31 vs 29.58 tok/s）——
-> prefill 融合与 decode 工程优化的收益在**大 batch / 并发**；③ CUDA Graph 的
-> batch=1 收益（147.7 tok/s / 6.3ms，5x）见 2.2 表——B=1 时 CPU 提交占比最高，
-> 图恰好把这个开销归零。
+> **注意**：① v3.0 起 generate() 也走 CUDA Graph（main.py/bench.py 默认开，
+> `--no-graph` 或 QWEN3_CUDA_GRAPH=0 关闭）——串行 decode 31.1 → 7.3 ms/tok，
+> 吞吐 31.02 → 129.82 tok/s（4.2x）；② 图关闭时 v3.0 串行与 v2.2 持平
+> （31.02/32.2，实测），说明收益全部来自 CPU 提交归零；③ v2.1/v2.2 的
+> 单请求串行与 v1.1 基本持平（~29-31 vs 29.58 tok/s）——prefill 融合与
+> decode 工程优化的收益原在**大 batch / 并发**，v3.0 让 B=1 也吃满
+> （CPU 提交占比最高，图恰好归零）。
 
 ### 2.2 连续批处理（bench_batched.py，GPU 空闲）
 
@@ -107,7 +108,10 @@ v3.0 实测（64 序列，input [32,128], output [16,64], greedy，decode 走 CU
 6. **v3.0 消除 CPU 提交**：CUDA Graph 把 decode 步整图捕获，每步 ~33 次 kernel
    启动 → 1 次 replay。batch=8 墙钟 39.9 → ~2ms/步（~20x），batch=1 也吃满
    （31.1 → 6.3 ms/tok，5x）——图收益与 batch 无关，B=1 时占比更高。
-7. **新瓶颈 = 纯 GPU kernel 时间**：batch=28 时 0.4 ms/tok 已低于单请求带宽下限
+7. **串行引擎同样受益**：generate() 集成图后（main.py/bench.py 默认开），
+   单请求 decode 32.0 → 7.3 ms/tok，吞吐 31.02 → 129.82 tok/s（4.2x）——
+   与 batch=1 图路径量级一致（6.3ms 略优于串行循环的 7.3ms）。
+8. **新瓶颈 = 纯 GPU kernel 时间**：batch=28 时 0.4 ms/tok 已低于单请求带宽下限
    （0.75ms，权重 1.5GB / 2TB/s），批并行充分摊薄；继续提速需 TP/多卡或权重级优化。
 
 ---
@@ -524,6 +528,9 @@ batch=28 无图 443.1 / 图 1500.4（**3.4x**）。
 - decode 每步仍在图外算 cos/sin（`rotary_emb`，一次 CPU 启动）——可移入图
 - prefill 的 K/V 写入仍是 PyTorch advanced indexing（decode 已 Triton）
 - chunked prefill 混批 / 优先级调度（P1-P2）
+
+> 已完：generate()/main.py/bench.py 单请求路径集成图（decode 32 → 7.3 ms/tok，
+> 4.2x）；图路径单请求也走批 kernel（合并 K/V 写入一并吃到）。
 
 ---
 

@@ -11,6 +11,7 @@ write by Claude code +deepseek4
 """
 
 import argparse
+import os
 import statistics
 import time
 from random import randint, seed
@@ -19,6 +20,8 @@ import torch
 
 from qwen3 import Qwen3Config, Qwen3ForCausalLM, KVCachePool
 from qwen3 import load_weights_from_safetensors
+from qwen3.PagedKVcache import PagedKVCache
+from qwen3.graph_runner import GraphRunner
 from generate import generate
 
 
@@ -107,6 +110,8 @@ def main():
                         help="Profiler trace 输出文件 (default: trace.json)")
     parser.add_argument("--profile-steps", type=int, default=10,
                         help="Profiler 采样的 decode step 数 (default: 10)")
+    parser.add_argument("--no-graph", action="store_true",
+                        help="禁用 CUDA Graph decode（默认开，QWEN3_CUDA_GRAPH=0 亦可）")
     args = parser.parse_args()
 
     # 验证参数
@@ -171,9 +176,15 @@ def main():
 
     # --- KV Cache 共享池 ---
     block_size = 16
+    use_graph = (
+        device.type == "cuda" and not args.no_graph
+        and os.environ.get("QWEN3_CUDA_GRAPH", "1") != "0"
+    )
     max_seq_tokens = args.max_input_len + args.max_output_len
     num_blocks = (max_seq_tokens + block_size - 1) // block_size
     num_blocks = max(num_blocks, 128)
+    if use_graph:
+        num_blocks += 2   # 图预留：占位句柄 + 哑行各 1 块
     kv_pool = KVCachePool(
         num_blocks=num_blocks,
         num_layers=config.num_hidden_layers,
@@ -187,6 +198,13 @@ def main():
     pool_mem_mb = (kv_pool.k_buffer.numel() * kv_pool.k_buffer.element_size()
                    + kv_pool.v_buffer.numel() * kv_pool.v_buffer.element_size()) / 1024**2
     print(f"  KV pool: {num_blocks} blocks x {block_size} tokens, {pool_mem_mb:.1f} MB")
+
+    # --- CUDA Graph（decode 图池，单请求 bucket=1）---
+    runner = None
+    if use_graph:
+        occupy = [PagedKVCache(kv_pool)]   # 占位句柄（capture 时贡献 pool + 长度校验）
+        runner = GraphRunner(model, kv_pool, occupy, buckets=(1,), reserve_pages=1)
+        print(f"  CUDA Graph: 开启（decode 走图，--no-graph 关闭）")
 
     # ============================================================
     # 4. 预热
@@ -205,6 +223,7 @@ def main():
             temperature=args.temperature,
             eos_token_id=-1,  # 不触发 EOS
             kv_cache_pool=kv_pool,
+            graph_runner=runner,
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -245,6 +264,7 @@ def main():
             temperature=args.temperature,
             eos_token_id=-1,  # 忽略 EOS，保证生成长度精确可控
             kv_cache_pool=kv_pool,
+            graph_runner=runner,
         )
 
         if device.type == "cuda":
@@ -385,6 +405,7 @@ def main():
                 temperature=args.temperature,
                 eos_token_id=-1,
                 kv_cache_pool=kv_pool,
+                graph_runner=runner,
             )
 
         # --- 算子耗时排名 ---
