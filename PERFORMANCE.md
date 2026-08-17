@@ -42,7 +42,7 @@ v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正）
 v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4）
 v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel）
 v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入）
-v2.3  CUDA Graph decode（GraphRunner 图池，当前）
+v3.0  CUDA Graph decode（GraphRunner 图池，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
@@ -50,7 +50,8 @@ v2.3  CUDA Graph decode（GraphRunner 图池，当前）
 - **v2.x = Continuous Batching 时代**（多请求并发调度，吞吐量级提升）
 - **v2.1 起 = prefill 计算融合**（QKᵀ/softmax/PV 折叠进单个 Triton kernel）
 - **v2.2 = decode 工程流水线**（块表/seq_len GPU 常驻 + K/V 写入合并单 kernel，不引入新算法）
-- **v2.3 = CPU 提交归零**（decode 整步捕获成 CUDA Graph，replay 单次启动）
+- **v3.0 = 执行模型代际**（decode 整步捕获成 CUDA Graph，eager → replay，
+  新增执行层 GraphRunner，与调度层/存储层/计算层并列）
 
 ---
 
@@ -66,20 +67,20 @@ v2.3  CUDA Graph decode（GraphRunner 图池，当前）
 | v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
 | v2.1 | f3c2d40 | + flash prefill 融合 kernel | 29.27 | 34.1 | **35.3** | 2.06 |
 | v2.2 | 4c4aa2e | + GPU 常驻块表 + Triton K/V 写入 | **31.3** | **31.8** | **35.3** | 2.06 |
-| v2.3 | c1f94d5 | + CUDA Graph decode（batch=1 图） | **~120** | **5.9** | **35.3** | 2.06 |
+| v3.0 | c1f94d5 | + CUDA Graph decode（batch=1 图） | **~120** | **5.9** | **35.3** | 2.06 |
 
 > v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
 > 同环境重跑；v1.1 为当时版本实测；v2.1/v2.2 为本次（2026-08）实测。
 >
 > **注意**：v2.1/v2.2 单请求串行下与 v1.1 基本持平（~29-31 vs 29.58 tok/s）——
 > prefill 融合与 decode 工程优化的收益在**大 batch / 并发**（批路径块表组装消失，
-> 吞吐 batch 8/16/28 = 194.6/330.8/513.7 tok/s）；v2.3 起 CUDA Graph 让
+> 吞吐 batch 8/16/28 = 194.6/330.8/513.7 tok/s）；v3.0 起 CUDA Graph 让
 > **batch=1 也吃到量级收益**（31.1 → 5.9 ms/tok，5.3x）——B=1 时 CPU 提交
 > 占比最高，图恰好把这个开销归零。
 
 ### 2.2 连续批处理（bench_batched.py，GPU 空闲）
 
-v2.3 实测（64 序列，input [32,128], output [16,64], greedy，decode 走 CUDA Graph）：
+v3.0 实测（64 序列，input [32,128], output [16,64], greedy，decode 走 CUDA Graph）：
 
 | Mode | Batch | Throughput | Decode | vs serial |
 |---|---|---|---|---|
@@ -101,7 +102,7 @@ v2.3 实测（64 序列，input [32,128], output [16,64], greedy，decode 走 CU
 4. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），对速度无贡献（v1.0 vs v0.2 decode 相同）。
 5. **吞吐拐点被 v2.2 改写**：块表常驻后 batch 8/16/28 达 194.6/330.8/513.7 tok/s，
    吞吐仍随 batch 增长（CPU 组装不再是瓶颈），拐点推后——完整扫描见 3.8。
-6. **v2.3 消除 CPU 提交**：CUDA Graph 把 decode 步整图捕获，每步 ~33 次 kernel
+6. **v3.0 消除 CPU 提交**：CUDA Graph 把 decode 步整图捕获，每步 ~33 次 kernel
    启动 → 1 次 replay。batch=8 墙钟 39.9 → ~2ms/步（~20x），batch=1 也吃满
    （31.1 → 5.9 ms/tok）——图收益与 batch 无关，B=1 时占比更高。
 7. **新瓶颈 = 纯 GPU kernel 时间**：batch=28 时 0.4 ms/tok 已低于单请求带宽下限
@@ -452,7 +453,7 @@ decode 墙钟 39.9ms 里仍有 23.3ms 是 CPU 空等 GPU（kernel 启动间隙�
 
 ---
 
-### 3.9 v2.3 — CUDA Graph decode（GraphRunner 图池）
+### 3.9 v3.0 — CUDA Graph decode（GraphRunner 图池）
 
 > 基准：`bench_batched.py`（64 序列，input [32,128], output [16,64], greedy）
 > 提交：c1f94d5（GraphRunner + driver 集成）
@@ -491,7 +492,7 @@ decode 墙钟 39.9ms 里仍有 23.3ms 是 CPU 空等 GPU（kernel 启动间隙�
 
 #### 收益归因（vs v2.2）
 
-| batch | v2.2 吞吐 | v2.3 吞吐 | 提升 |
+| batch | v2.2 吞吐 | v3.0 吞吐 | 提升 |
 |---|---|---|---|
 | 8 | 194.6 | ~630 | +224% |
 | 16 | 330.8 | ~900 | +172% |
@@ -500,7 +501,7 @@ decode 墙钟 39.9ms 里仍有 23.3ms 是 CPU 空等 GPU（kernel 启动间隙�
 - **CPU 提交归零**：每步 ~33 次 kernel 启动 + 启动间隙（v2.2 墙钟 39.9ms 中
   23.3ms 空等）→ 1 次 replay。batch=8 墙钟 ~40 → ~2ms（~20x）
 - **B=1 也吃满**：单请求 31.1 → 5.9 ms/tok（5.3x）——B=1 时 CPU 提交占比最高，
-  图收益与 batch 无关（v2.1/v2.2 的优化在 B=1 基本无感，v2.3 反超 naive cat
+  图收益与 batch 无关（v2.1/v2.2 的优化在 B=1 基本无感，v3.0 反超 naive cat
   v0.1 的 24.3ms）
 - **剩余 = 纯 GPU kernel 时间**：batch=28 达 0.4 ms/tok，低于单请求权重带宽下限
   （0.75ms = 1.5GB / 2TB/s）——批并行已充分摊薄权重读，下一步是 TP/多卡
