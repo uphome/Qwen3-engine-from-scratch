@@ -124,24 +124,25 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）
 | v1.0 Triton decode | 34.6 | 864.6 | 27.16 | 2.06 GB |
 | v1.1 标准 prefill | 33.7 | 35.0 | 29.58 | 2.06 GB |
 | v2.2 无图 | 31.8 | 35.3 | 31.3 | 2.06 GB |
-| **v3.0 CUDA Graph** | **5.9** | **35.3** | **~120** | **2.06 GB** |
+| v3.0 串行（无图） | 32.0 | 35.5 | 31.18 | 2.06 GB |
 
-（v3.0 单请求 = batch=1 图：decode 31.1 → 5.9 ms/tok，5.3x）
+（bench.py 串行不走 CUDA Graph——图只集成在 bench_batched 的 decode 步；
+batch=1 图路径见 3.2：31.1 → 6.3 ms/tok，5x）
 
 ### 3.2 连续批处理（bench_batched.py，64 序列，GPU 空闲）
 
 | Mode | Batch | Throughput | Decode | vs serial |
 |---|---|---|---|---|
-| serial | 1 | 28.1 tok/s | 34.7 ms/tok | 1.00x |
-| batched (v2.2 无图) | 8 | 194.6 | ~19.1 ms/步 | 6.93x |
-| batched (v2.2 无图) | 16 | 330.8 | - | 11.8x |
-| batched (v2.2 无图) | 28 | 513.7 | - | 18.3x |
-| batched (v3.0 图) | 8 | **~630** | **0.9 ms/tok** | **~22x** |
-| batched (v3.0 图) | 16 | **~900** | **0.6 ms/tok** | **~30x** |
-| batched (v3.0 图) | 28 | **1308** | **0.4 ms/tok** | **41.8x** |
+| serial | 1 | 30.7 tok/s | 32.0 ms/tok | 1.00x |
+| batched (无图) | 8 | 215.8 | 4.3 ms/tok | ~7x |
+| batched (无图) | 28 | 443.1 | 1.9 ms/tok | ~14x |
+| batched (图) | 1 | **147.7** | **6.3 ms/tok** | **4.74x** |
+| batched (图) | 8 | **688.2** | **1.1 ms/tok** | **21.95x** |
+| batched (图) | 16 | **1033.7** | **0.6 ms/tok** | **33.14x** |
+| batched (图) | 28 | **1500.4** | **0.4 ms/tok** | **48.10x** |
 
-CUDA Graph 收益（batch=28）：decode 16.6 → 0.4 ms/tok（~40x），
-吞吐 513.7 → 1308 tok/s（2.5x）；CPU 提交开销（每步 ~33 次启动）归零。
+CUDA Graph 收益（同环境消融）：batch=8 无图 215.8 / 图 688.2（**3.2x**），
+batch=28 无图 443.1 / 图 1500.4（**3.4x**）；CPU 提交开销（每步 ~33 次启动）归零。
 
 ### 3.3 瓶颈分析（batch=8，v3.0 图路径后 profile）
 
