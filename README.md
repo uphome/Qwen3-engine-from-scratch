@@ -16,6 +16,41 @@ python main.py --model /path/to/Qwen3-0.6B --temperature 0
 # 注：decode 默认走 CUDA Graph（v3.0）；--no-graph 或 QWEN3_CUDA_GRAPH=0 关闭
 ```
 
+## HTTP API 服务（OpenAI 兼容，零新依赖）
+
+> 完整参数、响应格式、调用示例与错误码见 [API.md](API.md)。
+
+```bash
+# 启动服务（后台线程跑 Scheduler 连续批处理，纯标准库 http.server）
+python server.py --model /path/to/Qwen3-0.6B --host 127.0.0.1 --port 8000
+
+# 查询模型
+curl http://127.0.0.1:8000/v1/models
+
+# Chat 补全（OpenAI chat.completion 格式，逐请求独立 temperature/top_k/top_p）
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"messages":[{"role":"user","content":"你好"}],"max_tokens":128,"temperature":0.7}'
+# 思考链默认关闭（空思考块，直接回答）；要开启请加 "enable_thinking": true
+# 函数调用：请求带 "tools" 即启用（OpenAI 标准格式，两轮 tool_calls 模式）
+
+# 纯 prompt 补全
+curl -X POST http://127.0.0.1:8000/v1/completions \
+     -H "Content-Type: application/json" \
+     -d '{"prompt":"1+1=","max_tokens":64}'
+```
+
+特性与边界（学习版取舍）：
+
+- `Engine` 后台单线程调度循环（复用 bench_batched 骨架），`queue.Queue` 收作业，
+  Scheduler 连续批处理（batch 满 4 时新请求仍能入队，decode 步共享）
+- KV 池按剩余显存自动裁剪（`--kv-ratio`，默认 0.6 留 40% 给 prefill 瞬时激活；
+  OOM 就调低，如 `--kv-ratio 0.5`）；推理中途 OOM 会返回 503 且服务不崩
+- 池满时新请求返回 503（不排队）；`stream` 参数暂不支持（返回 400，流式留 v2）
+- 参数：`max_tokens`（默认 512）、`temperature`/`top_k`/`top_p` 每请求独立
+- 4GB 卡实测参考：单请求 prompt ≤ 1500 tokens 稳定；并发建议 ≤4 个短 prompt
+  （显存由 `batch-size`×`kv-ratio` 共同决定，可自行调节）
+
 ## 项目结构
 
 ```

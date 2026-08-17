@@ -34,10 +34,12 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--device", type=str, default=None,
                         help="设备 (默认: 自动选择)")
-    parser.add_argument("--pool-blocks", type=int, default=256,
-                        help="KV cache 池的物理块数 (默认: 256, 每块 16 tokens = 支持 4096 token 序列)")
+    parser.add_argument("--pool-blocks", type=int, default=400,
+                        help="KV cache 池的物理块数 (默认: 400, 每块 16 tokens = 支持 6400 token 序列)")
     parser.add_argument("--no-graph", action="store_true",
                         help="禁用 CUDA Graph decode（默认开，QWEN3_CUDA_GRAPH=0 亦可）")
+    parser.add_argument("--enable-thinking", action="store_true",
+                        help="开启模型思考链（默认关：空思考块，直接回答）")
     args = parser.parse_args()
 
     # --- 设备 ---
@@ -79,10 +81,26 @@ def main():
         device.type == "cuda" and not args.no_graph
         and os.environ.get("QWEN3_CUDA_GRAPH", "1") != "0"
     )
-    # 图预留：占位句柄 + 哑行各 1 块（单请求 bucket=(1,)）
-    num_blocks = max(args.pool_blocks, (args.max_tokens + block_size - 1) // block_size)
+    # 池容量 = 输入余量 + max_tokens 的块数（请求按 input_len + max_tokens
+    # 要块，只按 max_tokens 建池必然差 ceil(input_len/16) 块 → 边界 OOM）
+    max_input = 2048
+    num_blocks = max(args.pool_blocks,
+                     (max_input + args.max_tokens + block_size - 1) // block_size)
     if use_graph:
-        num_blocks += 2
+        num_blocks += 2          # 图预留：占位句柄 + 哑行各 1 块（单请求 bucket=(1,)）
+    # 显存自适应：4GB 小卡上池子太大直接 OOM（k_buffer 一次性分配）。
+    # 每块字节 = 层 × KV头 × 块 × head_dim × 2字节(bf16) × 2(K+V)；
+    # 留 10% 余量给 decode 激活 / 图工作区。
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        free_bytes = torch.cuda.mem_get_info(device)[0]
+        bytes_per_block = (config.num_hidden_layers * config.num_key_value_heads
+                           * block_size * config.head_dim * 2 * 2)
+        capacity = int(free_bytes * 0.9 / bytes_per_block)
+        if num_blocks > capacity:
+            print(f"  [WARN] 显存自适应: 请求 {num_blocks} 块, "
+                  f"剩余显存仅够 {capacity} 块, 已裁剪")
+            num_blocks = capacity
     kv_pool = KVCachePool(
         num_blocks=num_blocks,
         num_layers=config.num_hidden_layers,
@@ -128,7 +146,7 @@ def main():
             {"role": "system", "content": "You are a helpful assistant. Respond directly without thinking."},
             {"role": "user", "content": prompt},
         ]
-        text = format_chat(messages)
+        text = format_chat(messages, enable_thinking=args.enable_thinking)
         input_ids = torch.tensor([tokenizer.encode(text)], device=device)
 
         input_len = input_ids.shape[1]
