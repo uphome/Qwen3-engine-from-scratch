@@ -173,6 +173,19 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 下一步上限：权重分区（TP/张量并行）或多卡 → 单请求逼近 0.75ms
 ```
 
+**B=1 图路径 6.3ms 的构成分解**（提升空间分析）：
+
+| 构成 | 估计 | 说明 |
+|---|---|---|
+| 权重读（理论下限） | ~0.75ms | 1.5GB / 2TB/s，无法避免 |
+| kernel 启动/间隙 | ~1-2ms | 28 层 × ~12 个 kernel ≈ 330 次发射，图内每次 ~1-3µs |
+| GEMM 计算 | ~1-2ms | 小 GEMM 切块开销大，cuBLAS 吃不满 |
+| norm/rope/attention 杂项 | ~2-3ms | q/k/v 三独立投影、逐层中间量读写 |
+
+→ 距 0.75ms 下限还有 ~8x 空间，按性价比：**kernel 融合（P0）→ INT8 权重（P1）→ TP（P2）**；
+量化/TP 对满并发场景收益反而更大（权重读被 batch 摊薄后，剩余是计算/启动开销）。
+```
+
 ### 3.5 已修复的问题
 
 - `scheduler.py` prefill 补位超编 bug：`min(batch_size, waiting)` 未减 running 已有
@@ -211,10 +224,13 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P0 | CUDA Graph 捕获 decode 步 | 39.9 → 2ms/步（~20 倍，已落地） | 高 | [x] |
 | P0 | decode 跳过 mask/position 构造 | 砍掉无用 kernel | 低 | [x] |
 | P0 | decode 的 cos/sin 移入图 | 省每步 rotary_emb | 低 | [ ] |
+| P0 | QKV/MLP 投影融合（3→1 kernel） | B=1 decode 6.3 → ~3-4ms | 中 | [ ] |
 | P1 | prefill K/V 写入 Triton（变长+跨页） | 消除 PyTorch scatter | 中 | [ ] |
+| P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |
 | P2 | split-K decode kernel | 长上下文 decode 提速 | 中 | [ ] |
 | P2 | chunked prefill 混批 | 长 prompt 不卡批 | 高 | [ ] |
 | P2 | 优先级调度 + 抢占 | 短请求不饿死 | 中 | [ ] |
+| P2 | TP 张量并行 | 权重分卡带宽×N；B=1 通信占比高，大 batch 收益大 | 高 | [ ] |
 | P3 | prefix caching | 多轮对话省 prefill | 高 | [ ] |
 | P3 | fp8 KV cache | 带宽减半 | 中 | [ ] |
 | P3 | 采样进 GPU kernel | 消除 CPU 往返 | 中 | [ ] |
