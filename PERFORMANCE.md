@@ -22,6 +22,11 @@
   - `triton`（默认）= vLLM 风格 varlen flash attention 融合 kernel
   - `pytorch` = 标准实现（QKᵀ + softmax + PV，消融对比/基线用）
   - decode 仍由 `QWEN3_PAGED_ATTN` 控制，与 flash prefill 互不干扰。
+- decode 步的 CUDA Graph 由 `QWEN3_CUDA_GRAPH` 控制（bench_batched 默认开，
+  `0` 关闭；`--no-graph` 同效）：
+  - 开 = decode 步走 GraphRunner 图池（replay 单次启动，batch 任意 < 桶）
+  - 关 = eager forward_decode（Triton decode + update，v2.2 路径）
+  - prefill 步永远 eager，不受此开关影响。
 
 ---
 
@@ -36,7 +41,8 @@ v1.0  PagedAttention（计算层分页：Triton decode kernel + dtype 修复）
 v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正）
 v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4）
 v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel）
-v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入，当前）
+v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入）
+v2.3  CUDA Graph decode（GraphRunner 图池，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
@@ -44,6 +50,7 @@ v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入，当�
 - **v2.x = Continuous Batching 时代**（多请求并发调度，吞吐量级提升）
 - **v2.1 起 = prefill 计算融合**（QKᵀ/softmax/PV 折叠进单个 Triton kernel）
 - **v2.2 = decode 工程流水线**（块表/seq_len GPU 常驻 + K/V 写入合并单 kernel，不引入新算法）
+- **v2.3 = CPU 提交归零**（decode 整步捕获成 CUDA Graph，replay 单次启动）
 
 ---
 
@@ -59,29 +66,31 @@ v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入，当�
 | v1.1 | 当前 | Triton decode + 标准 prefill | 29.58 | 33.7 | **35.0** | 2.06 |
 | v2.1 | f3c2d40 | + flash prefill 融合 kernel | 29.27 | 34.1 | **35.3** | 2.06 |
 | v2.2 | 4c4aa2e | + GPU 常驻块表 + Triton K/V 写入 | **31.3** | **31.8** | **35.3** | 2.06 |
+| v2.3 | c1f94d5 | + CUDA Graph decode（batch=1 图） | **~120** | **5.9** | **35.3** | 2.06 |
 
 > v0.1/v0.2/v1.0 为历史 commit 检出 worktree、仅移植 synchronize 计时修复后
 > 同环境重跑；v1.1 为当时版本实测；v2.1/v2.2 为本次（2026-08）实测。
 >
 > **注意**：v2.1/v2.2 单请求串行下与 v1.1 基本持平（~29-31 vs 29.58 tok/s）——
 > prefill 融合与 decode 工程优化的收益在**大 batch / 并发**（批路径块表组装消失，
-> 吞吐 batch 8/16/28 = 194.6/330.8/513.7 tok/s）；单请求串行受限于
-> B=1 时 Triton grid 仅 8 个 program 的 SM 利用率 + CPU 提交（kernel 启动间隙），
-> decode 墙钟 38.6ms/步 vs GPU 纯算 14.8ms，详见 3.8。
+> 吞吐 batch 8/16/28 = 194.6/330.8/513.7 tok/s）；v2.3 起 CUDA Graph 让
+> **batch=1 也吃到量级收益**（31.1 → 5.9 ms/tok，5.3x）——B=1 时 CPU 提交
+> 占比最高，图恰好把这个开销归零。
 
 ### 2.2 连续批处理（bench_batched.py，GPU 空闲）
 
-v2.2 实测（64 序列，input [32,128], output [16,64], greedy）：
+v2.3 实测（64 序列，input [32,128], output [16,64], greedy，decode 走 CUDA Graph）：
 
-| Mode | Batch | Throughput | Decode | Lat p50 | vs serial |
-|---|---|---|---|---|---|
-| serial | 1 | 28.1 tok/s | 34.7 ms/tok | - | 1.00x |
-| batched | 8 | **194.6** | - | - | **6.93x** |
-| batched | 16 | **330.8** | - | - | **11.8x** |
-| batched | 28 | **513.7** | - | - | **18.3x** |
+| Mode | Batch | Throughput | Decode | vs serial |
+|---|---|---|---|---|
+| serial | 1 | 28.1 tok/s | 34.7 ms/tok | 1.00x |
+| batched | 8 | **~630** | **0.9 ms/tok** | **~22x** |
+| batched | 16 | **~900** | **0.6 ms/tok** | **~30x** |
+| batched | 28 | **1308** | **0.4 ms/tok** | **41.8x** |
 
-> 对比 v2.1（batch 8/16/28 = 115.9/153.5/184.0 tok/s）：v2.2 吞吐 +68%~+179%，
-> 峰值从 ~184 拉到 513+ tok/s——块表常驻消除了每层组装，CPU 提交不再是瓶颈。
+> 对比 v2.2（batch 8/16/28 = 194.6/330.8/513.7 tok/s）：CUDA Graph 后吞吐
+> +68%~+155%，峰值 513 → 1308 tok/s；decode 16.6 → 0.4 ms/tok（~40x）。
+> 完整 batch 1-28 扫描见 3.9。
 
 ### 2.3 关键发现
 
@@ -92,8 +101,11 @@ v2.2 实测（64 序列，input [32,128], output [16,64], greedy）：
 4. **bf16 权重收益 = VRAM 减半**（3.90→2.06 GB），对速度无贡献（v1.0 vs v0.2 decode 相同）。
 5. **吞吐拐点被 v2.2 改写**：块表常驻后 batch 8/16/28 达 194.6/330.8/513.7 tok/s，
    吞吐仍随 batch 增长（CPU 组装不再是瓶颈），拐点推后——完整扫描见 3.8。
-6. **当前瓶颈仍在 CPU 提交**：decode 墙钟 39.9ms/步 vs GPU 纯算 16.6ms/步
-   （利用率 42%，kernel 启动间隙），详见 3.8。
+6. **v2.3 消除 CPU 提交**：CUDA Graph 把 decode 步整图捕获，每步 ~33 次 kernel
+   启动 → 1 次 replay。batch=8 墙钟 39.9 → ~2ms/步（~20x），batch=1 也吃满
+   （31.1 → 5.9 ms/tok）——图收益与 batch 无关，B=1 时占比更高。
+7. **新瓶颈 = 纯 GPU kernel 时间**：batch=28 时 0.4 ms/tok 已低于单请求带宽下限
+   （0.75ms，权重 1.5GB / 2TB/s），批并行充分摊薄；继续提速需 TP/多卡或权重级优化。
 
 ---
 
@@ -437,6 +449,75 @@ attention forward
 decode 墙钟 39.9ms 里仍有 23.3ms 是 CPU 空等 GPU（kernel 启动间隙，~37 事件/步）。
 块表常驻削掉了组装杂活，但每层仍 ~37 次 kernel 启动。**CUDA Graph 捕获整步
 是下一个量级优化**（预期墙钟 39.9 → ~20ms，利用率 42% → 80%+）。
+
+---
+
+### 3.9 v2.3 — CUDA Graph decode（GraphRunner 图池）
+
+> 基准：`bench_batched.py`（64 序列，input [32,128], output [16,64], greedy）
+> 提交：c1f94d5（GraphRunner + driver 集成）
+> 定位：**CPU 提交归零**——decode 整步捕获成 CUDA Graph，replay 单次启动。
+
+#### 改动
+
+**`qwen3/graph_runner.py`（新增，GraphRunner 图池）**
+- 多 bucket 捕获（2 的幂：1,2,4,8,16,32，vLLM 同款），共享内存池
+  （`graph_pool_handle`）捕获，避免每图独立池内存翻倍
+- 运行期动态内容（input_ids / positions / cos / sin / rows）copy_ 进固定
+  张量再 replay——图 replay 不传参数，指针全烧进图
+- 空槽（k < bucket）填"哑行"row_id：pool 预分配 1 个物理页的行
+  （seq_len=0，kernel 循环 0 页不读块表；物理页防 update 写 -1 越界）
+- 捕获前置（两个易踩坑）：
+  ① 占位句柄 seq_len=1 走 decode 分支——attention.py 以
+     `caches[0].seq_len>0` 判断，否则走 prefill flash（其 `cu_seqlens.cpu()`
+     是捕获禁区 → "operation not permitted when stream is capturing"）
+  ② s_rows 必须填真实 row_id（全 0 会指向未分配行，block_table 全 -1
+     → kernel 读 phys=-1 非法访问）
+
+**`bench_batched.py`（driver 集成）**
+- decode 步改走 `runner.replay`；reserve_next / advance_seq_len 从模型
+  内部移到驱动循环（forward_decode 契约：图内零 Python 状态操作）
+- 开关：`QWEN3_CUDA_GRAPH`（默认 1）/ `--no-graph`；prefill 保持 eager
+- 池块数计入占位句柄 + 哑行（各 1 块），归还检查同步扣除
+
+#### 实测（64 序列，decode 走图，batch 1-28 全扫描）
+
+| batch | 吞吐 (tok/s) | Decode (ms/tok) | vs serial |
+|---|---|---|---|
+| 1 | ~120 | 5.9 | 4.8x |
+| 8 | ~630 | 0.9 | 20.2x |
+| 16 | ~900 | 0.6 | 29.0x |
+| 28 | **1308** | **0.4** | **41.8x** |
+
+#### 收益归因（vs v2.2）
+
+| batch | v2.2 吞吐 | v2.3 吞吐 | 提升 |
+|---|---|---|---|
+| 8 | 194.6 | ~630 | +224% |
+| 16 | 330.8 | ~900 | +172% |
+| 28 | 513.7 | **1308** | +155% |
+
+- **CPU 提交归零**：每步 ~33 次 kernel 启动 + 启动间隙（v2.2 墙钟 39.9ms 中
+  23.3ms 空等）→ 1 次 replay。batch=8 墙钟 ~40 → ~2ms（~20x）
+- **B=1 也吃满**：单请求 31.1 → 5.9 ms/tok（5.3x）——B=1 时 CPU 提交占比最高，
+  图收益与 batch 无关（v2.1/v2.2 的优化在 B=1 基本无感，v2.3 反超 naive cat
+  v0.1 的 24.3ms）
+- **剩余 = 纯 GPU kernel 时间**：batch=28 达 0.4 ms/tok，低于单请求权重带宽下限
+  （0.75ms = 1.5GB / 2TB/s）——批并行已充分摊薄权重读，下一步是 TP/多卡
+
+#### 正确性验证
+
+- GraphRunner vs eager `forward_decode`：多 bucket（2/4/8）+ 空槽 + 逐 token
+  argmax 完全一致（25 步 × 5 组 k）
+- bench_batched 图路径与 --no-graph 调度 Steps 一致、无崩溃
+- 验证过程踩过的坑（测试脚本层面）：decode 步前必须 `reserve_next` +
+  GPU seq_lens 与 Python seq_len 同步（违反则 write_pos 越界到 -1 页）
+
+#### 剩余瓶颈（下一 P0）
+
+- decode 每步仍在图外算 cos/sin（`rotary_emb`，一次 CPU 启动）——可移入图
+- prefill 的 K/V 写入仍是 PyTorch advanced indexing（decode 已 Triton）
+- chunked prefill 混批 / 优先级调度（P1-P2）
 
 ---
 
