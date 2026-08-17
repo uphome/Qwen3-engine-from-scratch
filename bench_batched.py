@@ -16,6 +16,7 @@
 """
 
 import argparse
+import os
 import statistics
 import time
 from random import randint, seed
@@ -24,6 +25,8 @@ import torch
 
 from qwen3 import Qwen3Config, Qwen3ForCausalLM, KVCachePool, Scheduler
 from qwen3 import load_weights_from_safetensors
+from qwen3.PagedKVcache import PagedKVCache
+from qwen3.graph_runner import GraphRunner
 from qwen3.request import Request
 from generate import generate
 
@@ -102,8 +105,13 @@ def run_serial(model, kv_pool, specs, temperature=0.0):
 
 
 @torch.no_grad()
-def run_batched(model, kv_pool, specs, batch_size, temperature=0.0):
-    """调度器驱动——continuous batching（与 batched_generate.py 同循环）"""
+def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
+                runner=None):
+    """调度器驱动——continuous batching（与 batched_generate.py 同循环）
+
+    runner: GraphRunner | None。非 None 时 decode 步走 CUDA Graph
+            （replay），prefill 步保持 eager（model 前向）。
+    """
     scheduler = Scheduler(kv_pool, batch_size=batch_size)
     for i, (input_ids, max_new_tokens) in enumerate(specs):
         scheduler.add(Request(
@@ -122,11 +130,34 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0):
         batch = scheduler.schedule()
         t_step = time.perf_counter()
 
-        input_ids = batch.build_input_ids()
-        logits = model(input_ids, kv_cache=batch.build_kv_caches(),
-                       input_lens=batch.input_lens)
-        last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
-                                device=logits.device) - 1
+        if batch.mode == "decode" and runner is not None:
+            # ---- decode 走 CUDA Graph：replay 替代 model 前向 ----
+            # 与 model.forward 的 decode 分支等价，但 reserve/advance
+            # 状态操作从模型内移到驱动循环（forward_decode 的契约）。
+            caches = batch.build_kv_caches()
+            for c in caches:
+                c.reserve_next()          # 页预留（原 forward 内部做）
+            start_pos = torch.tensor([c.seq_len for c in caches],
+                                     dtype=torch.long,
+                                     device=model.model.embed_tokens.weight.device)
+            positions = start_pos.unsqueeze(1)                       # (k, 1)
+            cos, sin = model.model.rotary_emb(positions)
+            rows = torch.tensor([c.row_id for c in caches],
+                                dtype=torch.int32, device=positions.device)
+            logits = runner.replay(
+                batch.build_input_ids(), positions,
+                cos.to(torch.bfloat16), sin.to(torch.bfloat16), rows)
+            logits = logits[:batch.size]          # (b,1,vocab) → 前 k 行有效
+            for c in caches:
+                c.advance_seq_len(1)      # 状态推进（原 forward 内部做）
+            last_idx = torch.zeros(batch.size, dtype=torch.long,
+                                   device=logits.device)
+        else:
+            input_ids = batch.build_input_ids()
+            logits = model(input_ids, kv_cache=batch.build_kv_caches(),
+                           input_lens=batch.input_lens)
+            last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
+                                    device=logits.device) - 1
         next_tokens = logits[torch.arange(last_idx.shape[0]), last_idx] \
             .argmax(dim=-1, keepdim=True)      # 贪心，与串行同口径
 
@@ -179,6 +210,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", action="store_true",
                         help="跑正式基准前预热（推荐 GPU 上开启）")
+    parser.add_argument("--no-graph", action="store_true",
+                        help="禁用 CUDA Graph decode（默认开，QWEN3_CUDA_GRAPH=0 亦可）")
     args = parser.parse_args()
 
     assert args.min_input_len <= args.max_input_len
@@ -219,12 +252,30 @@ def main():
     print(f"[data] {args.num_seqs} requests, "
           f"expected output tokens: {total_output}")
 
-    # ---- KV 池（块数按最大并发 batch 备足）----
+    # ---- CUDA Graph（decode 图池）----
+    # 开关：--no-graph 或 QWEN3_CUDA_GRAPH=0 关闭（默认开）。
+    # 构造时捕获 buckets 张图（占位句柄常驻 pool，预留少量块 + 哑行 1 块）。
+    batch_sizes = ([args.batch_size] if args.batch_size is not None
+                   else list(range(1, args.max_batch + 1)))
+    use_graph = (
+        device.type == "cuda" and not args.no_graph
+        and os.environ.get("QWEN3_CUDA_GRAPH", "1") != "0"
+    )
+    # buckets 用 2 的幂（vLLM 同款）：1,2,4,8,... ≥ max_batch 的最小幂。
+    # decode 步任意请求数 k 落进 >=k 的最小桶，空槽哑行占位；
+    # 避免逐 batch 捕获（max_batch=28 只需 6 张图而非 28 张）。
+    graph_buckets = [1]
+    if use_graph:
+        while graph_buckets[-1] < max(batch_sizes):
+            graph_buckets.append(graph_buckets[-1] * 2)
+
+    # ---- KV 池（块数按最大并发 batch 备足；graph 占位句柄 + 哑行各 1 块）----
     block_size = 16
     max_seq_tokens = args.max_input_len + args.max_output_len
     max_batch = args.max_batch if args.batch_size is None else args.batch_size
     blocks_per_seq = (max_seq_tokens + block_size - 1) // block_size
-    num_blocks = max(128, blocks_per_seq * min(max_batch, args.num_seqs))
+    num_blocks = max(128, blocks_per_seq * min(max_batch, args.num_seqs)
+                     + (max(graph_buckets) + 1 if use_graph else 0))
     kv_pool = KVCachePool(
         num_blocks=num_blocks, num_layers=config.num_hidden_layers,
         block_size=block_size, num_kv_heads=config.num_key_value_heads,
@@ -234,6 +285,16 @@ def main():
     print(f"[pool] {num_blocks} blocks x {block_size} "
           f"(>= {blocks_per_seq} blocks/seq x {max_batch} batch)")
 
+    runner = None
+    if use_graph:
+        occupy = [PagedKVCache(kv_pool) for _ in range(max(graph_buckets))]
+        runner = GraphRunner(model, kv_pool, occupy,
+                             buckets=tuple(graph_buckets), reserve_pages=1)
+        # 占位句柄 + 哑行各占 1 块，池归还检查要扣除
+        n_reserved = max(graph_buckets) + 1
+    else:
+        n_reserved = 0
+
     # ---- 预热 ----
     if args.warmup:
         print("[warmup] ...")
@@ -241,16 +302,14 @@ def main():
                                      (1, min(64, args.max_input_len)),
                                      device=device), 16)]
         run_serial(model, kv_pool, warm_specs)
-        run_batched(model, kv_pool, warm_specs, batch_size=2)
+        run_batched(model, kv_pool, warm_specs, batch_size=2, runner=runner)
 
     # ---- 基准 ----
-    batch_sizes = ([args.batch_size] if args.batch_size is not None
-                   else list(range(1, args.max_batch + 1)))
     results = [run_serial(model, kv_pool, specs)]
     for bs in batch_sizes:
         print(f"[run] batch_size={bs} ...")
-        results.append(run_batched(model, kv_pool, specs, bs))
-        assert kv_pool.free_count == kv_pool.total_blocks, \
+        results.append(run_batched(model, kv_pool, specs, bs, runner=runner))
+        assert kv_pool.free_count == kv_pool.total_blocks - n_reserved, \
             f"batch={bs} 池未归还: {kv_pool.free_count}/{kv_pool.total_blocks}"
 
     # ---- 报告 ----
