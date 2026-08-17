@@ -11,8 +11,9 @@ cd Qwen3-engine-from-scratch
 # 依赖: torch, safetensors, tokenizers
 pip install torch safetensors tokenizers
 
-# 下载 Qwen3-0.6B 并运行
-python main.py --model /path/to/Qwen3-0.6B --prompt "你好" --temperature 0
+# 下载 Qwen3-0.6B 并运行（交互式：输入 prompt 生成，/quit 退出）
+python main.py --model /path/to/Qwen3-0.6B --temperature 0
+# 注：decode 默认走 CUDA Graph（v3.0）；--no-graph 或 QWEN3_CUDA_GRAPH=0 关闭
 ```
 
 ## 项目结构
@@ -65,6 +66,9 @@ python profile_decode.py --model /path/to/Qwen3-0.6B --mode prefill --prompt-len
 python bench_batched.py --model /path/to/Qwen3-0.6B --num-seqs 64 --max-batch 28 --warmup
 # 关闭 CUDA Graph（消融对比）：--no-graph 或 export QWEN3_CUDA_GRAPH=0
 python bench_batched.py --model /path/to/Qwen3-0.6B --batch-size 8 --no-graph
+
+# 单请求基准（bench.py 串行也走图，与 main.py 同路径）
+python bench.py --model /path/to/Qwen3-0.6B --num-seqs 64 --no-graph
 ```
 
 已有指标：吞吐（tok/s）、延迟分布（p50/p95/p99）、VRAM 占用、Prefill/Decode 占比、算子级 CUDA 耗时排名。
