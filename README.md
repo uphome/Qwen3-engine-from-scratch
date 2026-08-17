@@ -22,15 +22,23 @@ python main.py --model /path/to/Qwen3-0.6B --prompt "你好" --temperature 0
 ├── generate.py           # 自回归生成 + 采样（temperature/top-k/top-p）
 ├── chat_template.py      # Qwen3 Chat Format（<|im_start|>...）
 ├── bench.py              # 吞吐基准测试 + torch.profiler trace 导出
+├── bench_batched.py      # 连续批处理基准（Scheduler 调度，decode 走 CUDA Graph）
+├── profile_decode.py     # prefill/decode 步 kernel 时间剖析
 └── qwen3/                # 核心模型
     ├── config.py         # Qwen3Config — 纯数据类
     ├── norm.py           # RMSNorm
     ├── rope.py           # RotaryEmbedding
     ├── kv_cache.py       # NaiveKVCache
-    ├── attention.py      # Qwen3Attention（GQA + QK-Norm）
+    ├── PagedKVcache.py   # 分页 KV（共享池 + GPU 常驻 2D 块表 + row_id 行槽位）
+    ├── attention.py      # Qwen3Attention（GQA + QK-Norm，三段式：flash/varlen/decode）
     ├── mlp.py            # Qwen3MLP（SwiGLU）
     ├── decoder.py        # Qwen3DecoderLayer（Pre-Norm）
-    ├── model.py          # Qwen3Model + Qwen3ForCausalLM
+    ├── model.py          # Qwen3Model + Qwen3ForCausalLM（含 forward_decode）
+    ├── scheduler.py      # 连续批处理调度器（waiting/running/finished）
+    ├── batch.py          # Batch（prefill 右 pad / decode 组装）
+    ├── request.py        # Request 状态机
+    ├── graph_runner.py   # CUDA Graph 图池（decode 整步捕获，2 的幂 bucket）
+    ├── kernels/          # Triton kernels（paged attention / flash varlen）
     └── weights.py        # safetensors 权重加载
 ```
 
@@ -52,6 +60,11 @@ python bench.py --model /path/to/Qwen3-0.6B --profile --profile-output trace.jso
 
 # prefill/decode 步 kernel 时间分布（--mode prefill 剖析融合 kernel）
 python profile_decode.py --model /path/to/Qwen3-0.6B --mode prefill --prompt-len 256
+
+# 连续批处理基准（batch 1..N 扫描；decode 默认走 CUDA Graph 图池）
+python bench_batched.py --model /path/to/Qwen3-0.6B --num-seqs 64 --max-batch 28 --warmup
+# 关闭 CUDA Graph（消融对比）：--no-graph 或 export QWEN3_CUDA_GRAPH=0
+python bench_batched.py --model /path/to/Qwen3-0.6B --batch-size 8 --no-graph
 ```
 
 已有指标：吞吐（tok/s）、延迟分布（p50/p95/p99）、VRAM 占用、Prefill/Decode 占比、算子级 CUDA 耗时排名。
