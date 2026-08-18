@@ -263,6 +263,7 @@ class Engine:
         log.log(REQUEST_LEVEL, f"入队 req#{job.request_id}: "
                  f"in={input_len}, max={job.max_new_tokens}, T={job.temperature}")
 
+    @torch.no_grad()
     def _step(self):
         """一个调度步（与 bench_batched.py run_batched 循环同构）"""
         batch = self.scheduler.schedule()
@@ -312,6 +313,10 @@ class Engine:
             # 完成者：收集输出 + 归还记账 + 通知 HTTP 线程
             for req in batch.requests:
                 if req.state == "finished":
+                    # 从 scheduler.finished 中移除，避免长期服务中
+                    # 已结束 Request 的 input_ids 等 GPU 张量被无限保留导致显存上涨
+                    if req in self.scheduler.finished:
+                        self.scheduler.finished.remove(req)
                     job = self._jobs.pop(req.request_id, None)
                     if job is None:
                         continue
