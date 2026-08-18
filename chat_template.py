@@ -20,7 +20,7 @@ def format_chat(messages: list[dict], enable_thinking: bool = True) -> str:
                    {"role": "user", "content": "..."}, ...]
         enable_thinking: True=思考模式开启（跟官方模板默认一致，模型自己输出
             思考链）；False=关闭，在 assistant 后追加一个"空思考块"
-            （' thinking\\n\\n response\\n\\n'）——模型训练识别此为关闭信号，
+            （'<think>\\n\\n</think>\\n\\n'）——模型训练识别此为关闭信号，
             直接回答。对齐官方 tokenizer_config.json 的渲染逻辑。
 
     Returns:
@@ -39,5 +39,5 @@ def format_chat(messages: list[dict], enable_thinking: bool = True) -> str:
     text += "<|im_start|>assistant\n"
     if not enable_thinking:
         # 与 Qwen3 官方模板逐字符一致：空 think 块 = 思考关闭信号
-        text += " thinking\n\n response\n\n"
+        text += "<think>\n\n</think>\n\n"
     return text
