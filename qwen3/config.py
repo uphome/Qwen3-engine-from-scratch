@@ -37,6 +37,7 @@ class Qwen3Config:
     intermediate_size: int
     rms_norm_eps: float
     rope_theta: float
+    max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
 
     @classmethod
@@ -67,5 +68,6 @@ class Qwen3Config:
             intermediate_size=data["intermediate_size"],
             rms_norm_eps=data["rms_norm_eps"],
             rope_theta=data["rope_theta"],
+            max_position_embeddings=data.get("max_position_embeddings", 4096),
             tie_word_embeddings=data.get("tie_word_embeddings", False),
         )

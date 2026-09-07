@@ -278,12 +278,10 @@ class Engine:
                 start_pos = torch.tensor([c.seq_len for c in caches],
                                          dtype=torch.long, device=self.device)
                 positions = start_pos.unsqueeze(1)                  # (k, 1)
-                cos, sin = self.model.model.rotary_emb(positions)
                 rows = torch.tensor([c.row_id for c in caches],
                                     dtype=torch.int32, device=self.device)
                 logits = self.runner.replay(
-                    batch.build_input_ids(), positions,
-                    cos.to(torch.bfloat16), sin.to(torch.bfloat16), rows)
+                    batch.build_input_ids(), positions, rows)
                 logits = logits[:batch.size]      # (b,1,vocab) → 前 k 行有效
                 for c in caches:
                     c.advance_seq_len(1)          # 状态推进（原 forward 内部做）

@@ -141,12 +141,10 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
                                      dtype=torch.long,
                                      device=model.model.embed_tokens.weight.device)
             positions = start_pos.unsqueeze(1)                       # (k, 1)
-            cos, sin = model.model.rotary_emb(positions)
             rows = torch.tensor([c.row_id for c in caches],
                                 dtype=torch.int32, device=positions.device)
             logits = runner.replay(
-                batch.build_input_ids(), positions,
-                cos.to(torch.bfloat16), sin.to(torch.bfloat16), rows)
+                batch.build_input_ids(), positions, rows)
             logits = logits[:batch.size]          # (b,1,vocab) → 前 k 行有效
             for c in caches:
                 c.advance_seq_len(1)      # 状态推进（原 forward 内部做）

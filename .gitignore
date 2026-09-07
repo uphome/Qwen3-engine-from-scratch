@@ -16,3 +16,5 @@ trace.json
 *.qdrep
 *.nsys-rep
 logs/
+
+.codegraph/

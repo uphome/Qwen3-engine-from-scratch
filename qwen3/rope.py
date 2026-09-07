@@ -31,49 +31,42 @@ import torch.nn as nn
 
 
 class RotaryEmbedding(nn.Module):
-    """阶段一：预计算角度表
+    """阶段一：预计算完整 cos/sin 角度表
 
-    有状态部分只有 inv_freq（频率表，注册为 buffer 随模型迁移 dtype/device）。
-    forward 只依赖 position_ids，产出 cos/sin 角度表 —— 不知道 Q/K 长什么样。
+    有状态部分：
+      - inv_freq：频率表（由 head_dim/base 推导）
+      - cos_table / sin_table：预计算的完整位置角度表，shape (max_seq_len, head_dim)
+    forward 只按 position_ids 查表，不再现场计算三角函数。
     """
 
-    def __init__(self, head_dim: int, base: float = 1000000.0):
+    def __init__(self, head_dim: int, base: float = 1000000.0,
+                 max_seq_len: int = 4096):
         super().__init__()
         # 频率表: θ_i = 1 / (base^(2i/d)), i = 0, 1, ..., d/2-1
         #   - 只有 d/2 个频率：每"对"维度（2D 旋转）共享一个频率，d 维 = d/2 对
         #   - torch.arange(0, head_dim, 2) → [0, 2, 4, ..., d-2]（取偶数下标）
         #   - base 越大频率越低（旋转越慢），Qwen3 用 1e6，长上下文友好
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-        # register_buffer: 不占梯度、不参与参数计数；persistent=False 不进 state_dict
-        # （inv_freq 可由参数推导，无需随权重保存）
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+        # 预计算 [0, max_seq_len) 所有位置的 cos/sin 表。
+        # 推理时只做 gather，不再每步 einsum + cat + cos + sin。
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.einsum("s,d->sd", positions, inv_freq)          # (max_seq_len, d/2)
+        emb = torch.cat((freqs, freqs), dim=-1)                       # (max_seq_len, d)
+        self.register_buffer("cos_table", emb.cos(), persistent=False)
+        self.register_buffer("sin_table", emb.sin(), persistent=False)
+
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """位置 → 旋转角度 → cos/sin 角度表
+        """位置 → 查表 → cos/sin 角度表
 
         position_ids: (batch, seq_len) — 每个 token 的位置
           - 单请求 prefill: (1, S)，位置 0..S-1
           - 批 decode: (B, 1)，每行是各请求自己的 seq_len（各不相同！）
         """
-        # 旋转角度 = 位置 × 频率:
-        #   freqs[b, s, i] = position_ids[b, s] * inv_freq[i]  → (B, S, d/2)
-        # 这是"外积"的批量推广（旧版 torch.outer(position_ids[0], inv_freq)
-        # 只能处理单行，批 decode 每行位置不同必须逐行算）。
-        # 注意: (B,S) @ (d/2,) 是矩阵向量乘（得 (B,)），不是外积 —— 必须用
-        # einsum 显式声明输出形状 (B, S, d/2)。
-        freqs = torch.einsum("bs,d->bsd", position_ids.float(), self.inv_freq)
-        #不同batch 拥有不同的 token位置
-
-        # 复制拼接成完整 head_dim: (B, S, head_dim)
-        #   为什么 cat？角度总数（d/2 个）只有维度数（d 个）的一半 ——
-        #   每对维度共享一个旋转角。cat 两遍让 [第 i 维] 和 [第 i+64 维]
-        #   拿到同一个角度，正好匹配前后配对约定（rotate_half 与之配套）。
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        # 角度 → 三角函数。返回 (B, S, head_dim)：
-        #   apply_rotary_pos_emb 里 unsqueeze(1) 成 (B, 1, S, head_dim)，
-        #   与 q/k 的 (B, H, S, D) 沿头维广播
-        return emb.cos(), emb.sin()
+        # 注意：这里只做纯 GPU gather，不能有 .item()/max() 等 CPU 同步操作，
+        # 否则 CUDA Graph capture 会失败。表长度需覆盖所有可能位置。
+        return self.cos_table[position_ids], self.sin_table[position_ids]
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
