@@ -286,8 +286,13 @@ def main():
     runner = None
     if use_graph:
         occupy = [PagedKVCache(kv_pool) for _ in range(max(graph_buckets))]
+        t_capture0 = time.perf_counter()
         runner = GraphRunner(model, kv_pool, occupy,
                              buckets=tuple(graph_buckets), reserve_pages=1)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        capture_s = time.perf_counter() - t_capture0
+        print(f"[graph] CUDA Graph capture/instantiation time: {capture_s:.2f}s")
         # 占位句柄 + 哑行各占 1 块，池归还检查要扣除
         n_reserved = max(graph_buckets) + 1
     else:

@@ -42,7 +42,8 @@ v1.1  优化版（prefill 标准 attention + 向量化 update + 计时修正）
 v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4）
 v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel）
 v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入）
-v3.0  CUDA Graph decode（GraphRunner 图池，当前）
+v3.0  CUDA Graph decode（GraphRunner 图池）
+v3.1  RoPE 预计算表 + CUDA Graph 内查表（P0-1，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
@@ -52,6 +53,8 @@ v3.0  CUDA Graph decode（GraphRunner 图池，当前）
 - **v2.2 = decode 工程流水线**（块表/seq_len GPU 常驻 + K/V 写入合并单 kernel，不引入新算法）
 - **v3.0 = 执行模型代际**（decode 整步捕获成 CUDA Graph，eager → replay，
   新增执行层 GraphRunner，与调度层/存储层/计算层并列）
+- **v3.1 = RoPE 图内化**（预计算完整 cos/sin 表，decode 查表进图，
+  去掉每步图外 rotary_emb 与 cos/sin copy_）
 
 ---
 
@@ -525,7 +528,7 @@ batch=28 无图 443.1 / 图 1500.4（**3.4x**）。
 
 #### 剩余瓶颈（下一 P0）
 
-- decode 每步仍在图外算 cos/sin（`rotary_emb`，一次 CPU 启动）——可移入图
+- ~~decode 每步仍在图外算 cos/sin（`rotary_emb`，一次 CPU 启动）~~ → 已由 v3.1 移入图内
 - prefill 的 K/V 写入仍是 PyTorch advanced indexing（decode 已 Triton）
 - chunked prefill 混批 / 优先级调度（P1-P2）
 
@@ -545,6 +548,47 @@ batch=28 无图 443.1 / 图 1500.4（**3.4x**）。
 6.3 → 3-4ms）→ **P1 权重 INT8**（带宽减半，下限 0.75 → 0.4ms）→ **P2 TP 多卡**
 （权重分卡带宽×N；注意量化/TP 对满并发 batch=28 收益反而更大——权重读被
 batch 摊薄后剩余是计算/启动开销，融合对所有 batch 都受益）。
+
+
+### 3.10 v3.1 — RoPE 预计算表移入 CUDA Graph（P0-1）
+
+> 基准：`bench_batched.py`（64 序列，input [32,256], output [32,128], greedy，decode 走 CUDA Graph）
+> 对比：旧图 `4f46e76` vs 新图 `5187b2a`，两者均为 **CUDA Graph decode**，不是 graph vs eager
+> 定位：将 decode 每步图外 `rotary_emb()` 计算改为预计算 `cos/sin` 表 + 图内查表，
+> 去掉每步的 RoPE 三角函数计算与 `cos/sin` `copy_`。
+
+#### 改动
+
+- `qwen3/rope.py`：预计算完整 `cos_table` / `sin_table`，`forward()` 改为纯 GPU gather
+- `qwen3/config.py`：新增 `max_position_embeddings`，用于决定 RoPE 表长度
+- `qwen3/model.py`：`forward_decode()` 改为接收 `position_ids`，内部通过 RoPE 表查表
+- `qwen3/graph_runner.py`：移除 `s_cos` / `s_sin`，`replay(input_ids, positions, rows)`
+- `generate.py` / `bench_batched.py` / `server.py`：调用方不再传 `cos/sin`
+
+#### 实测（新旧图均为 CUDA Graph decode）
+
+| Batch | 旧图 Throughput (tok/s) | 新图 Throughput (tok/s) | Throughput 提升 | 旧图 Decode (ms/tok) | 新图 Decode (ms/tok) | Decode 提升 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 142.3 | 150.1 | 1.055x | 6.44 | 6.19 | 1.039x |
+| 2 | 232.9 | 246.8 | 1.060x | 3.71 | 3.59 | 1.033x |
+| 3 | 332.4 | 331.4 | 0.997x | 2.53 | 2.49 | 1.017x |
+| 4 | 421.4 | 423.0 | 1.004x | 1.93 | 1.89 | 1.020x |
+| 5 | 493.8 | 501.0 | 1.015x | 1.61 | 1.58 | 1.015x |
+| 6 | 531.4 | 568.1 | 1.069x | 1.37 | 1.35 | 1.016x |
+| 7 | 615.5 | 639.9 | 1.040x | 1.19 | 1.18 | 1.013x |
+| 8 | 683.2 | 689.6 | 1.009x | 1.07 | 1.05 | 1.013x |
+
+> Decode ms/tok 按 `decode_time / 实际输出 tokens` 重新计算，比表格中的
+> 四舍五入值更精确。新图 capture/instantiation time 约 `10.74s`，属一次性初始化成本；
+> 旧图当时未单独记录 capture time。
+
+#### 结论
+
+- 小 batch（1-2）吞吐提升约 **5-6%**，decode 每 token 提升约 **3-4%**
+- 中高 batch 吞吐提升约 **1-7%**，decode 每 token 提升约 **1-2%**
+- 高 batch 下 CPU 启动开销已被并行摊薄，因此 RoPE 图内化收益变小
+- 该优化主要减少 decode 路径的 CPU 侧 RoPE 计算与拷贝，属于图结构内的工程优化
+
 
 ---
 

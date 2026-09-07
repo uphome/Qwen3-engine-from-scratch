@@ -203,8 +203,13 @@ def main():
     runner = None
     if use_graph:
         occupy = [PagedKVCache(kv_pool)]   # 占位句柄（capture 时贡献 pool + 长度校验）
+        t_capture0 = time.perf_counter()
         runner = GraphRunner(model, kv_pool, occupy, buckets=(1,), reserve_pages=1)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        capture_s = time.perf_counter() - t_capture0
         print(f"  CUDA Graph: 开启（decode 走图，--no-graph 关闭）")
+        print(f"  CUDA Graph capture/instantiation time: {capture_s:.2f}s")
 
     # ============================================================
     # 4. 预热
