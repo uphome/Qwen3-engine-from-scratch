@@ -18,9 +18,19 @@ import torch.nn.functional as F
 class Qwen3MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # gate 和 up 共享同一输入 x，融合成一个 gate_up_proj 大 GEMM。
+        # 输出维度 = 2 * intermediate_size，forward 中再按 config 动态切回。
+        self.intermediate_size = config.intermediate_size
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size,
+            2 * config.intermediate_size,
+            bias=False,
+        )
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # 一次大 GEMM 后按中间维度切回 gate / up
+        gate_up = self.gate_up_proj(x)
+        gate = gate_up[..., :self.intermediate_size]
+        up = gate_up[..., self.intermediate_size:]
+        return self.down_proj(F.silu(gate) * up)

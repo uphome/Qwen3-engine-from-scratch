@@ -21,9 +21,10 @@
 - [x] batch 16/32 扫描找吞吐拐点（v2.2 后 batch 8/16/28 = 194.6/330.8/513.7 tok/s）
 - [x] CUDA Graph decode（GraphRunner 图池，2 的幂 bucket + 哑行占位，v3.0）
 - [x] 批路径 decode 跳过 mask/position 构造（Triton 路径本就 None）
+- [x] decode 的 cos/sin RoPE 计算移入图（v3.1，预计算表 + 图内查表）
+- [x] QKV/MLP 投影融合（v3.2，qkv_proj / gate_up_proj，3→1/2→1 GEMM）
 
 ### 工程流水线（P0，收益最大）
-- [ ] decode 的 cos/sin RoPE 计算移入图（当前每步 rotary_emb，尚有优化空间）
 
 ### 调度层（P1-P2）
 - [ ] chunked prefill：长 prompt 切片与 decode 混批
@@ -223,8 +224,8 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 |---|---|---|---|---|
 | P0 | CUDA Graph 捕获 decode 步 | 39.9 → 2ms/步（~20 倍，已落地） | 高 | [x] |
 | P0 | decode 跳过 mask/position 构造 | 砍掉无用 kernel | 低 | [x] |
-| P0 | decode 的 cos/sin 移入图 | 省每步 rotary_emb | 低 | [ ] |
-| P0 | QKV/MLP 投影融合（3→1 kernel） | B=1 decode 6.3 → ~3-4ms | 中 | [ ] |
+| P0 | decode 的 cos/sin 移入图 | 省每步 rotary_emb / copy_ | 低 | [x] |
+| P0 | QKV/MLP 投影融合（3→1 kernel） | decode 每 token +4.6%~6.0% | 中 | [x] |
 | P1 | prefill K/V 写入 Triton（变长+跨页） | 消除 PyTorch scatter | 中 | [ ] |
 | P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |
 | P2 | split-K decode kernel | 长上下文 decode 提速 | 中 | [ ] |

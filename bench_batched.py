@@ -141,12 +141,10 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
                                      dtype=torch.long,
                                      device=model.model.embed_tokens.weight.device)
             positions = start_pos.unsqueeze(1)                       # (k, 1)
-            cos, sin = model.model.rotary_emb(positions)
             rows = torch.tensor([c.row_id for c in caches],
                                 dtype=torch.int32, device=positions.device)
             logits = runner.replay(
-                batch.build_input_ids(), positions,
-                cos.to(torch.bfloat16), sin.to(torch.bfloat16), rows)
+                batch.build_input_ids(), positions, rows)
             logits = logits[:batch.size]          # (b,1,vocab) → 前 k 行有效
             for c in caches:
                 c.advance_seq_len(1)      # 状态推进（原 forward 内部做）
@@ -288,8 +286,13 @@ def main():
     runner = None
     if use_graph:
         occupy = [PagedKVCache(kv_pool) for _ in range(max(graph_buckets))]
+        t_capture0 = time.perf_counter()
         runner = GraphRunner(model, kv_pool, occupy,
                              buckets=tuple(graph_buckets), reserve_pages=1)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        capture_s = time.perf_counter() - t_capture0
+        print(f"[graph] CUDA Graph capture/instantiation time: {capture_s:.2f}s")
         # 占位句柄 + 哑行各占 1 块，池归还检查要扣除
         n_reserved = max(graph_buckets) + 1
     else:

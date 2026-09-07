@@ -11,13 +11,17 @@ Qwen3 Chat Template — 手动实现 Jinja 模板逻辑
 """
 
 
-def format_chat(messages: list[dict]) -> str:
+def format_chat(messages: list[dict], enable_thinking: bool = True) -> str:
     """
     将 messages 列表转换为 Qwen3 chat template 字符串
 
     Args:
         messages: [{"role": "system", "content": "..."},
                    {"role": "user", "content": "..."}, ...]
+        enable_thinking: True=思考模式开启（跟官方模板默认一致，模型自己输出
+            思考链）；False=关闭，在 assistant 后追加一个"空思考块"
+            （'<think>\\n\\n</think>\\n\\n'）——模型训练识别此为关闭信号，
+            直接回答。对齐官方 tokenizer_config.json 的渲染逻辑。
 
     Returns:
         格式化后的字符串，以 "<|im_start|>assistant\\n" 结尾
@@ -33,4 +37,7 @@ def format_chat(messages: list[dict]) -> str:
         elif role == "assistant":
             text += f"<|im_start|>assistant\n{content}<|im_end|>\n"
     text += "<|im_start|>assistant\n"
+    if not enable_thinking:
+        # 与 Qwen3 官方模板逐字符一致：空 think 块 = 思考关闭信号
+        text += "<think>\n\n</think>\n\n"
     return text

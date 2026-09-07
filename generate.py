@@ -81,12 +81,10 @@ def generate(
                 start_pos = kv_cache.seq_len     # 图外读（replay 前）
                 positions = torch.tensor([[start_pos]], dtype=torch.long,
                                          device=input_ids.device)
-                cos, sin = model.model.rotary_emb(positions)
                 rows = torch.tensor([kv_cache.row_id], dtype=torch.int32,
                                     device=input_ids.device)
                 logits = graph_runner.replay(
-                    generated[:, -1:], positions,
-                    cos.to(torch.bfloat16), sin.to(torch.bfloat16), rows)
+                    generated[:, -1:], positions, rows)
                 logits = logits[:1]              # (b,1,vocab) → 前 k 行有效
                 kv_cache.advance_seq_len(1)      # 状态推进（原 forward 内部做）
             else:
