@@ -43,7 +43,8 @@ v2.0  连续批处理（Scheduler 调度，batch 扫描 1-4）
 v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel）
 v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入）
 v3.0  CUDA Graph decode（GraphRunner 图池）
-v3.1  RoPE 预计算表 + CUDA Graph 内查表（P0-1，当前）
+v3.1  RoPE 预计算表 + CUDA Graph 内查表（P0-1）
+v3.2  QKV/MLP 投影融合（P0-2，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
@@ -55,6 +56,8 @@ v3.1  RoPE 预计算表 + CUDA Graph 内查表（P0-1，当前）
   新增执行层 GraphRunner，与调度层/存储层/计算层并列）
 - **v3.1 = RoPE 图内化**（预计算完整 cos/sin 表，decode 查表进图，
   去掉每步图外 rotary_emb 与 cos/sin copy_）
+- **v3.2 = QKV/MLP 投影融合**（q/k/v 合并为 qkv_proj，gate/up 合并为
+  gate_up_proj，减少小 GEMM 启动次数，不改变数学结果）
 
 ---
 
@@ -588,6 +591,52 @@ batch 摊薄后剩余是计算/启动开销，融合对所有 batch 都受益）
 - 中高 batch 吞吐提升约 **1-7%**，decode 每 token 提升约 **1-2%**
 - 高 batch 下 CPU 启动开销已被并行摊薄，因此 RoPE 图内化收益变小
 - 该优化主要减少 decode 路径的 CPU 侧 RoPE 计算与拷贝，属于图结构内的工程优化
+
+
+
+### 3.11 v3.2 — QKV/MLP 投影融合（P0-2）
+
+> 基准：`bench_batched.py`（64 序列，input [32,256], output [32,128], greedy，decode 走 CUDA Graph）
+> 对比：旧版 `46c1578`（q/k/v、gate/up 独立投影） vs 新版（已融合为 qkv_proj / gate_up_proj）
+> 定位：多个共享同一输入的线性投影合并为一次大 GEMM，减少 kernel 启动次数；
+> 权重沿输出维拼接，forward 中按 config 动态切回，数学等价。
+
+#### 改动
+
+- `qwen3/attention.py`：`q_proj/k_proj/v_proj` 合并为 `qkv_proj`
+- `qwen3/mlp.py`：`gate_proj/up_proj` 合并为 `gate_up_proj`
+- `qwen3/weights.py`：加载原始 HF 权重时自动拼接 q/k/v、gate/up
+
+#### 正确性
+
+- 融合前后真实 Qwen3-0.6B logits 对比：
+  - max abs diff = 0.0
+  - argmax 完全一致
+
+#### 实测（两者均为 CUDA Graph decode）
+
+| Batch | 旧版 Throughput (tok/s) | 新版 Throughput (tok/s) | Throughput 提升 | 旧版 Decode (ms/tok) | 新版 Decode (ms/tok) | Decode 提升 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 150.1 | 158.3 | 1.055x | 6.20 | 5.84 | 1.060x |
+| 2 | 245.6 | 258.6 | 1.053x | 3.60 | 3.41 | 1.056x |
+| 3 | 338.4 | 346.2 | 1.023x | 2.51 | 2.37 | 1.055x |
+| 4 | 424.4 | 428.5 | 1.010x | 1.91 | 1.81 | 1.053x |
+| 5 | 499.1 | 513.2 | 1.028x | 1.59 | 1.51 | 1.052x |
+| 6 | 567.5 | 586.3 | 1.033x | 1.35 | 1.29 | 1.051x |
+| 7 | 640.1 | 611.9 | 0.956x | 1.18 | 1.13 | 1.046x |
+| 8 | 686.7 | 705.2 | 1.027x | 1.06 | 1.01 | 1.046x |
+
+> Decode ms/tok 按 `decode_time / 实际输出 tokens` 重新计算。
+> 新版 capture/instantiation time 约 `15.98s`，旧版约 `6.24s`，均为一次性初始化成本；
+> capture time 波动可能来自机器状态，不作为主要收益指标。
+
+#### 结论
+
+- Decode 每 token 稳定提升约 **4.6%-6.0%**
+- 小 batch 吞吐提升约 **5.5%**，大 batch 吞吐提升约 **1%-3%**
+- batch=7 的吞吐出现一次反向波动（0.956x），但 decode 耗时仍提升约 4.6%，
+  应为运行噪声/批调度波动
+- 融合不改变计算量，收益主要来自减少小 GEMM kernel 启动次数
 
 
 ---

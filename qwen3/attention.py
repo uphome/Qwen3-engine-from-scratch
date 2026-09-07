@@ -46,9 +46,15 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
 
         # Q, K, V, O 线性投影
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        # QKV 投影融合：三个共享同一输入的小 GEMM 合并成一个大 GEMM。
+        # 输出维度 = q_out + k_out + v_out，forward 中再按 config 动态切回。
+        self.q_output_dim = self.num_heads * self.head_dim
+        self.kv_output_dim = self.num_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(
+            config.hidden_size,
+            self.q_output_dim + 2 * self.kv_output_dim,
+            bias=False,
+        )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
 
         # QK-Norm: 对每个头的 Q, K 做 RMSNorm (在 head_dim 上归一化)
@@ -68,10 +74,18 @@ class Qwen3Attention(nn.Module):
         B, S, _ = hidden_states.shape
 
         # 投影 Q, K, V 并 reshape 成多头格式
-        # (B, S, hidden) -> (B, S, heads, head_dim) -> (B, heads, S, head_dim)
-        q = self.q_proj(hidden_states).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # 先一次大 GEMM 得到 qkv，再按 config 动态切分：
+        #   q 占前 q_output_dim
+        #   k 占 q_output_dim .. q_output_dim+kv_output_dim
+        #   v 占最后 kv_output_dim
+        # (B, S, hidden) -> (B, S, q+k+v) -> split -> (B, S, heads, head_dim) -> (B, heads, S, head_dim)
+        qkv = self.qkv_proj(hidden_states)
+        q = qkv[..., :self.q_output_dim].view(
+            B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = qkv[..., self.q_output_dim:self.q_output_dim + self.kv_output_dim].view(
+            B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = qkv[..., self.q_output_dim + self.kv_output_dim:].view(
+            B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # QK-Norm (Qwen3 特有 — 在 RoPE 之前归一化 Q, K)
         q = self.q_norm(q)
