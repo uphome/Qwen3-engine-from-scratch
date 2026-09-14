@@ -35,13 +35,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 import torch
-import torch.nn.functional as F
 
 from qwen3 import Qwen3Config, Qwen3ForCausalLM, KVCachePool, Scheduler
 from qwen3 import load_weights_from_safetensors
 from qwen3.PagedKVcache import PagedKVCache
 from qwen3.graph_runner import GraphRunner
 from qwen3.request import Request
+from qwen3.sampling import sample_tokens
 from chat_template import format_chat
 
 EOS_TOKEN_ID = 151645
@@ -133,27 +133,6 @@ def adaptive_num_blocks(requested: int, config, block_size: int,
         log.warning("显存自适应: 请求 %d 块, 剩余显存仅够 %d 块, 已裁剪", requested, capacity)
         return max(1, capacity)
     return requested
-
-
-def sample_one(logits: torch.Tensor, temperature: float,
-               top_k: int, top_p: float) -> torch.Tensor:
-    """单请求采样（generate.py 的采样逻辑抽成函数，参数随请求独立）"""
-    if temperature == 0:
-        return logits.argmax(dim=-1)
-    logits = logits / temperature
-    if top_k > 0:
-        topk_vals = torch.topk(logits, min(top_k, logits.size(-1))).values
-        logits = logits.masked_fill(logits < topk_vals[..., -1], float("-inf"))
-    if top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        mask = cumprobs > top_p
-        mask[..., 1:] = mask[..., :-1].clone()
-        mask[..., 0] = False
-        remove = mask.scatter(-1, sorted_idx, mask)
-        logits = logits.masked_fill(remove, float("-inf"))
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
 
 
 # ============================================================
@@ -295,16 +274,15 @@ class Engine:
                 last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
                                         device=logits.device) - 1
 
-            # 逐请求采样（参数随请求独立；B ≤ batch_size，开销可忽略）
-            next_tokens = torch.zeros(batch.size, 1, dtype=torch.long,
-                                      device=logits.device)
-            for i, req in enumerate(batch.requests):
-                job = self._jobs.get(req.request_id)
-                if job is None:                   # 理论不可达，防御
-                    next_tokens[i, 0] = logits[i, last_idx[i]].argmax()
-                    continue
-                next_tokens[i, 0] = sample_one(
-                    logits[i, last_idx[i]], job.temperature, job.top_k, job.top_p)
+            # 批量 GPU 采样（减少逐请求算子启动；参数仍随请求独立）
+            batch_jobs = [self._jobs.get(req.request_id) for req in batch.requests]
+            temperatures = [(j.temperature if j is not None else 0.0) for j in batch_jobs]
+            top_ks = [(j.top_k if j is not None else 0) for j in batch_jobs]
+            top_ps = [(j.top_p if j is not None else 1.0) for j in batch_jobs]
+            batch_logits = logits[torch.arange(batch.size, device=logits.device), last_idx]
+            next_tokens = sample_tokens(
+                batch_logits, temperature=temperatures,
+                top_k=top_ks, top_p=top_ps).long()
 
             self.scheduler.on_step_done(batch, next_tokens)
 
@@ -684,7 +662,7 @@ def main():
     # ---- 预热（kernel 编译 + 图捕获已在构造时完成；再走一遍完整调度路径）----
     warm_ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
     warm_job = Job(request_id=-1, input_ids=warm_ids, max_new_tokens=8,
-                   temperature=0, top_k=50, top_p=0.9, eos_token_id=-1)
+                   temperature=0.7, top_k=50, top_p=0.9, eos_token_id=-1)
     engine.submit(warm_job)
     if warm_job.done.wait(120):
         log.info("  Warmup: 完成 (32 in / 8 out)")

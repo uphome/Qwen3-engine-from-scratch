@@ -44,7 +44,8 @@ v2.1  prefill FlashAttention 融合（vLLM 风格 varlen kernel）
 v2.2  decode 批路径工程优化（GPU 常驻块表 + Triton K/V 写入）
 v3.0  CUDA Graph decode（GraphRunner 图池）
 v3.1  RoPE 预计算表 + CUDA Graph 内查表（P0-1）
-v3.2  QKV/MLP 投影融合（P0-2，当前）
+v3.2  QKV/MLP 投影融合（P0-2）
+v3.3  GPU 采样（batch top-k + Triton Gumbel-max，当前）
 ```
 
 - **v0.x = 计算层未分页**（attention 仍走标准实现，分页只影响存储）
@@ -58,6 +59,8 @@ v3.2  QKV/MLP 投影融合（P0-2，当前）
   去掉每步图外 rotary_emb 与 cos/sin copy_）
 - **v3.2 = QKV/MLP 投影融合**（q/k/v 合并为 qkv_proj，gate/up 合并为
   gate_up_proj，减少小 GEMM 启动次数，不改变数学结果）
+- **v3.3 = GPU 采样**（batch topk + Triton kernel 完成 temperature/top-p/
+  Gumbel-max，B 个请求的采样启动次数从 ~8B 降到 2，支持请求级独立参数）
 
 ---
 
@@ -637,6 +640,71 @@ batch 摊薄后剩余是计算/启动开销，融合对所有 batch 都受益）
 - batch=7 的吞吐出现一次反向波动（0.956x），但 decode 耗时仍提升约 4.6%，
   应为运行噪声/批调度波动
 - 融合不改变计算量，收益主要来自减少小 GEMM kernel 启动次数
+
+
+
+### 3.12 v3.3 — GPU 采样（batch top-k + Triton Gumbel-max）
+
+> 基准：`bench_sampling.py`（随机 logits，vocab=151936，steps=200，
+>        temperature=0.7，top_k=50，top_p=0.9，GPU=A100）
+> 对比：旧逐请求 Python 采样 vs 新批量 topk + Triton 采样 kernel
+> 定位：不改变采样分布，只减少 kernel 启动次数和 Python 逐请求循环。
+
+#### 改动
+
+- 新增 `qwen3/sampling.py`
+  - `sample_tokens()`：统一批量 GPU 采样入口，支持每请求独立参数
+  - `_sample_topk_kernel()`：Triton kernel，一次完成 temperature 缩放、
+    k_eff mask、softmax、top-p mask、Gumbel-max 采样、gather token id
+  - 不满足条件时（CPU / top_k=0 / top_k 超范围）回退批量 PyTorch 路径
+- `generate.py` / `server.py` / `batched_generate.py`：接入 `sample_tokens()`
+- `server.py` 保留请求级独立 temperature / top_k / top_p
+
+#### 实测（采样微基准）
+
+| Batch | 旧逐请求采样 (ms/step) | 新批量 GPU 采样 (ms/step) | 加速比 |
+|---:|---:|---:|---:|
+| 1 | 0.902 | 0.226 | 3.98x |
+| 8 | 5.380 | 0.235 | 22.91x |
+| 28 | 18.744 | 0.248 | 75.48x |
+
+> 新采样每步耗时基本恒定（~0.23ms），旧实现随 batch 线性增长；
+> batch=28 时旧采样单步 18.7ms，新实现降到 0.25ms。
+
+#### 正确性
+
+- greedy 完全一致
+- `top_k=1` 与 argmax 完全一致
+- Gumbel-max 与 `torch.multinomial` 分布等价，但不保证随机序列逐样本一致
+
+#### 端到端 continuous batching（`bench_batched.py --temperature 0.7`）
+
+> 64 序列，input [32,256]，output [32,128]，top_k=50，top_p=0.9，
+> decode 走 CUDA Graph；旧/新服务端代码用同一份 bench 脚本，区别只在采样实现。
+
+| Batch | 旧采样 Throughput | 新采样 Throughput | Throughput 提升 | 旧采样 Decode | 新采样 Decode | Decode 提升 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 142.7 tok/s | 153.4 tok/s | +7.5% | 6.54 ms/tok | 6.06 ms/tok | -7.3% |
+| 2 | 220.4 | 254.1 | +15.3% | 4.08 | 3.51 | -14.2% |
+| 3 | 287.2 | 336.6 | +17.2% | 3.05 | 2.46 | -19.2% |
+| 4 | 343.3 | 417.5 | +21.6% | 2.48 | 1.88 | -24.3% |
+| 5 | 384.5 | 481.5 | +25.2% | 2.18 | 1.58 | -27.8% |
+| 6 | 420.7 | 544.8 | +29.5% | 1.96 | 1.34 | -31.5% |
+| 7 | 455.7 | 608.2 | +33.5% | 1.80 | 1.18 | -34.7% |
+| 8 | **479.3** | **660.6** | **+37.8%** | **1.68** | **1.06** | **-36.9%** |
+
+> 旧采样每次 decode 要为每个请求单独走 topk / sort / cumsum / multinomial；
+> 新采样一次 batch topk + 一次 Triton kernel 完成全部请求。
+> batch 越大，旧采样随 B 线性增长的开销被放大，新采样基本恒定，因此端到端收益随 batch 上升。
+> serial 路径（不使用 CUDA Graph）随机波动较大，不作为本次对比的主要依据。
+
+#### 结论
+
+- B 个请求的采样启动次数从约 `8×B` 次降到 **2 次**（1 次 topk + 1 次 Triton）
+- 微基准：batch=28 时采样环节 **18.7 → 0.25 ms/step（~75x）**
+- 端到端：batch=8 吞吐 **479.3 → 660.6 tok/s（+37.8%）**，
+  decode **1.68 → 1.06 ms/tok（-36.9%）**
+- 该优化对服务端随机采样场景收益最大；greedy 路径继续直接 argmax，不受影响
 
 
 ---

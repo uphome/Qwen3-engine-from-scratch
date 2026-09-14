@@ -13,6 +13,7 @@ from .request import Request, WAITING, PREFILLING, DECODING, FINISHED
 from .batch import Batch
 from .scheduler import Scheduler
 from .weights import load_weights_from_hf, load_weights_from_safetensors
+from .sampling import sample_tokens
 
 __all__ = [
     "Qwen3Config",
@@ -29,4 +30,5 @@ __all__ = [
     "Scheduler",
     "load_weights_from_hf",
     "load_weights_from_safetensors",
+    "sample_tokens",
 ]

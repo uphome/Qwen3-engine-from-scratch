@@ -25,11 +25,11 @@ import argparse
 import time
 
 import torch
-import torch.nn.functional as F
 
 from qwen3 import Qwen3Config, Qwen3ForCausalLM, KVCachePool, Scheduler
 from qwen3 import load_weights_from_safetensors
 from qwen3.request import Request
+from qwen3.sampling import sample_tokens
 
 
 def make_requests(num_seqs: int, max_len: int, vocab_size: int,
@@ -46,28 +46,6 @@ def make_requests(num_seqs: int, max_len: int, vocab_size: int,
             eos_token_id=eos_token_id,
         ))
     return requests
-
-
-@torch.no_grad()
-def sample(logits: torch.Tensor, temperature: float = 0.0,
-           top_k: int = 50, top_p: float = 0.9) -> torch.Tensor:
-    """从 (B, vocab) logits 采样，每行一个 token → (B, 1)"""
-    if temperature == 0:
-        return logits.argmax(dim=-1, keepdim=True)
-    logits = logits / temperature
-    if top_k > 0:
-        vals = torch.topk(logits, min(top_k, logits.size(-1))).values
-        logits = logits.masked_fill(logits < vals[..., -1:], float("-inf"))
-    if top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        mask = cumprobs > top_p
-        mask[..., 1:] = mask[..., :-1].clone()
-        mask[..., 0] = False
-        remove = mask.scatter(-1, sorted_idx, mask)
-        logits = logits.masked_fill(remove, float("-inf"))
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1)
 
 
 def main():
@@ -120,7 +98,7 @@ def main():
         #   decode 批 S=1 → 位置 0；prefill 批右 pad → 各请求 input_len-1
         last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
                                 device=logits.device) - 1
-        next_tokens = sample(logits[torch.arange(last_idx.shape[0]), last_idx])
+        next_tokens = sample_tokens(logits[torch.arange(last_idx.shape[0]), last_idx])
 
         scheduler.on_step_done(batch, next_tokens)
         n_steps += 1

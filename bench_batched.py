@@ -30,6 +30,46 @@ from qwen3.graph_runner import GraphRunner
 from qwen3.request import Request
 from generate import generate
 
+try:
+    from qwen3.sampling import sample_tokens
+except Exception:
+    sample_tokens = None
+
+
+def _old_sample_one(logits, temperature, top_k, top_p):
+    """旧逐请求采样实现（用于旧代码 worktree 的对比）。"""
+    import torch.nn.functional as F
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+    logits = logits / temperature
+    if top_k > 0:
+        vals = torch.topk(logits, min(top_k, logits.size(-1))).values
+        logits = logits.masked_fill(logits < vals[..., -1:], float("-inf"))
+    if top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        mask = cumprobs > top_p
+        mask[..., 1:] = mask[..., :-1].clone()
+        mask[..., 0] = False
+        remove = mask.scatter(-1, sorted_idx, mask)
+        logits = logits.masked_fill(remove, float("-inf"))
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
+def _sample_next(logits_2d, temperature, top_k, top_p):
+    """统一采样入口：新代码走 sample_tokens，旧代码走逐请求采样。"""
+    if temperature == 0:
+        return logits_2d.argmax(dim=-1, keepdim=True)
+    if sample_tokens is not None:
+        return sample_tokens(logits_2d, temperature=temperature,
+                             top_k=top_k, top_p=top_p)
+    out = torch.zeros(logits_2d.shape[0], 1, dtype=torch.long,
+                      device=logits_2d.device)
+    for i in range(logits_2d.shape[0]):
+        out[i, 0] = _old_sample_one(logits_2d[i], temperature, top_k, top_p)
+    return out
+
 
 def resolve_device(device_str: str | None) -> torch.device:
     if device_str:
@@ -71,7 +111,8 @@ def format_table(headers: list[str], rows: list[list[str]]) -> str:
 # 避免跨 run 复用同一批 Request 对象（num_generated/state 会污染后续 run）。
 
 @torch.no_grad()
-def run_serial(model, kv_pool, specs, temperature=0.0):
+def run_serial(model, kv_pool, specs, temperature=0.0,
+               top_k=50, top_p=0.9):
     """逐个请求 generate()——串行基线（请求共享池，公平对比）"""
     t0 = time.perf_counter()
     prefill_ms = 0.0
@@ -84,6 +125,7 @@ def run_serial(model, kv_pool, specs, temperature=0.0):
             model, input_ids,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            top_k=top_k, top_p=top_p,
             eos_token_id=-1,          # 不触发 EOS，生成长度精确可控
             kv_cache_pool=kv_pool,
         )
@@ -106,7 +148,7 @@ def run_serial(model, kv_pool, specs, temperature=0.0):
 
 @torch.no_grad()
 def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
-                runner=None):
+                top_k=50, top_p=0.9, runner=None):
     """调度器驱动——continuous batching（与 batched_generate.py 同循环）
 
     runner: GraphRunner | None。非 None 时 decode 步走 CUDA Graph
@@ -156,8 +198,8 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
                            input_lens=batch.input_lens)
             last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
                                     device=logits.device) - 1
-        next_tokens = logits[torch.arange(last_idx.shape[0]), last_idx] \
-            .argmax(dim=-1, keepdim=True)      # 贪心，与串行同口径
+        batch_logits = logits[torch.arange(last_idx.shape[0]), last_idx]
+        next_tokens = _sample_next(batch_logits, temperature, top_k, top_p)
 
         if logits.is_cuda:
             torch.cuda.synchronize()
@@ -206,6 +248,10 @@ def main():
                         help="只跑指定 batch_size（跳过扫描）")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="采样温度；0=贪心，>0 走采样路径")
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--warmup", action="store_true",
                         help="跑正式基准前预热（推荐 GPU 上开启）")
     parser.add_argument("--no-graph", action="store_true",
@@ -304,14 +350,23 @@ def main():
         warm_specs = [(torch.randint(0, config.vocab_size,
                                      (1, min(64, args.max_input_len)),
                                      device=device), 16)]
-        run_serial(model, kv_pool, warm_specs)
-        run_batched(model, kv_pool, warm_specs, batch_size=2, runner=runner)
+        run_serial(model, kv_pool, warm_specs,
+                   temperature=args.temperature,
+                   top_k=args.top_k, top_p=args.top_p)
+        run_batched(model, kv_pool, warm_specs, batch_size=2,
+                    temperature=args.temperature,
+                    top_k=args.top_k, top_p=args.top_p, runner=runner)
 
     # ---- 基准 ----
-    results = [run_serial(model, kv_pool, specs)]
+    results = [run_serial(model, kv_pool, specs,
+                          temperature=args.temperature,
+                          top_k=args.top_k, top_p=args.top_p)]
     for bs in batch_sizes:
         print(f"[run] batch_size={bs} ...")
-        results.append(run_batched(model, kv_pool, specs, bs, runner=runner))
+        results.append(run_batched(model, kv_pool, specs, bs,
+                                   temperature=args.temperature,
+                                   top_k=args.top_k, top_p=args.top_p,
+                                   runner=runner))
         assert kv_pool.free_count == kv_pool.total_blocks - n_reserved, \
             f"batch={bs} 池未归还: {kv_pool.free_count}/{kv_pool.total_blocks}"
 

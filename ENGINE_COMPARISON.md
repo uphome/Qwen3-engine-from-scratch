@@ -23,6 +23,7 @@
 - [x] 批路径 decode 跳过 mask/position 构造（Triton 路径本就 None）
 - [x] decode 的 cos/sin RoPE 计算移入图（v3.1，预计算表 + 图内查表）
 - [x] QKV/MLP 投影融合（v3.2，qkv_proj / gate_up_proj，3→1/2→1 GEMM）
+- [x] GPU 内采样（v3.3，batch topk + Triton Gumbel-max，batch=28 采样提速 75x）
 
 ### 工程流水线（P0，收益最大）
 
@@ -234,7 +235,7 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P2 | TP 张量并行 | 权重分卡带宽×N；B=1 通信占比高，大 batch 收益大 | 高 | [ ] |
 | P3 | prefix caching | 多轮对话省 prefill | 高 | [ ] |
 | P3 | fp8 KV cache | 带宽减半 | 中 | [ ] |
-| P3 | 采样进 GPU kernel | 消除 CPU 往返 | 中 | [ ] |
+| P3 | 采样进 GPU kernel | batch=28 采样 18.7 → 0.25 ms/step | 中 | [x] |
 | P3 | 换出 (swap) | 显存超卖 | 高 | [ ] |
 
 （已完成项见第 0 节：块表常驻 / 块表缓存 / KV 清零 / 吞吐拐点扫描 /

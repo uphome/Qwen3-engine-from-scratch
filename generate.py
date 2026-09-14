@@ -21,9 +21,9 @@ LLM 生成文本的核心循环:
 import time
 
 import torch
-import torch.nn.functional as F
 
 from qwen3 import Qwen3ForCausalLM, KVCachePool, PagedKVCache
+from qwen3.sampling import sample_tokens
 
 
 @torch.no_grad()
@@ -102,30 +102,10 @@ def generate(
             # 取最后一个位置的 logits
             next_logits = logits[:, -1, :]  # shape: (batch, vocab_size)
 
-            # === 采样策略 ===
-            if temperature == 0:
-                # 贪心解码: 直接选概率最高的 token
-                next_token = next_logits.argmax(dim=-1, keepdim=True)
-            else:
-                next_logits = next_logits / temperature
-
-                # Top-K: 只保留概率最高的 K 个 token
-                if top_k > 0:
-                    topk_vals = torch.topk(next_logits, min(top_k, next_logits.size(-1))).values
-                    next_logits = next_logits.masked_fill(next_logits < topk_vals[..., -1:], float("-inf"))
-
-                # Top-P (Nucleus): 保留累积概率不超过 P 的 token
-                if top_p < 1.0:
-                    sorted_logits, sorted_idx = torch.sort(next_logits, descending=True)
-                    cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    mask = cumprobs > top_p
-                    mask[..., 1:] = mask[..., :-1].clone()
-                    mask[..., 0] = False
-                    remove = mask.scatter(-1, sorted_idx, mask)
-                    next_logits = next_logits.masked_fill(remove, float("-inf"))
-
-                probs = F.softmax(next_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
+            # === 采样策略（批量 GPU 采样，避免逐 token Python 分步）===
+            next_token = sample_tokens(
+                next_logits, temperature=temperature,
+                top_k=top_k, top_p=top_p)
 
             generated = torch.cat([generated, next_token], dim=-1)
 
