@@ -108,6 +108,7 @@ def main():
                               max_new_tokens=args.max_new, eos_token_id=-1))
         return sched
 
+    @torch.no_grad()   # 预热步不建反图（否则反图激活污染显存/耗时测量）
     def step_once(sched):
         """跑一个调度步（prefill 或 decode），返回 (mode, batch)
 
@@ -142,7 +143,8 @@ def main():
         caches = b.build_kv_caches()
         print(f"[profile] 一次 decode forward: input_ids={tuple(input_ids.shape)} "
               f"kv_caches={len(caches)} 个请求\n")
-        with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
+        with torch.profiler.profile(activities=activities, record_shapes=True) as prof, \
+                torch.no_grad():
             model(input_ids, kv_cache=caches, input_lens=b.input_lens)
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -159,7 +161,8 @@ def main():
         caches = b.build_kv_caches()
         print(f"[profile] 一次 prefill forward: input_ids={tuple(input_ids.shape)} "
               f"batch={b.size}, lens={b.input_lens}\n")
-        with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
+        with torch.profiler.profile(activities=activities, record_shapes=True) as prof, \
+                torch.no_grad():
             model(input_ids, kv_cache=caches, input_lens=b.input_lens)
             if device.type == "cuda":
                 torch.cuda.synchronize()

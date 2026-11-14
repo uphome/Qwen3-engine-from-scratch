@@ -48,6 +48,7 @@ def make_requests(num_seqs: int, max_len: int, vocab_size: int,
     return requests
 
 
+@torch.no_grad()   # 推理不建反图（否则每步激活随反图常驻 → 显存逐轮增长）
 def main():
     parser = argparse.ArgumentParser(description="Continuous batching 驱动（Phase 2）")
     parser.add_argument("--model", type=str, required=True)
