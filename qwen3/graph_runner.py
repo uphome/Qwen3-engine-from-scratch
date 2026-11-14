@@ -75,6 +75,7 @@ class GraphRunner:
 
     # ------------------------------------------------------------------
 
+    @torch.no_grad()   # 捕获期也不建反图（否则 logits 固定张量永久持有捕获时的反图）
     def _capture_all(self, caches):
         """对每个 bucket 捕获一张图"""
         device = self.pool.k_buffer.device

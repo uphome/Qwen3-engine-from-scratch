@@ -263,6 +263,7 @@ class Engine:
         log.log(REQUEST_LEVEL, f"入队 req#{job.request_id}: "
                  f"in={input_len}, max={job.max_new_tokens}, T={job.temperature}")
 
+    @torch.no_grad()   # 推理不需要梯度：不建反图，否则 28 层激活随反图常驻 → 每轮泄漏
     def _step(self):
         """一个调度步（与 bench_batched.py run_batched 循环同构）"""
         batch = self.scheduler.schedule()

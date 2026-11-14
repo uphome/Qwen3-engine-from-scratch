@@ -70,6 +70,7 @@ def sample(logits: torch.Tensor, temperature: float = 0.0,
     return torch.multinomial(probs, num_samples=1)
 
 
+@torch.no_grad()   # 推理不建反图（否则每步激活随反图常驻 → 显存逐轮增长）
 def main():
     parser = argparse.ArgumentParser(description="Continuous batching 驱动（Phase 2）")
     parser.add_argument("--model", type=str, required=True)
