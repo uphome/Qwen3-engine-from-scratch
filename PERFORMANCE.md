@@ -641,6 +641,22 @@ batch 摊薄后剩余是计算/启动开销，融合对所有 batch 都受益）
   应为运行噪声/批调度波动
 - 融合不改变计算量，收益主要来自减少小 GEMM kernel 启动次数
 
+#### 回归修复：fused qkv 切片与 update_kv_batch stride
+
+- **现象**：v3.2 融合后批量 rollout 只有第一条请求输出正确，其余请求乱码
+- **原因**：`qkv_proj` 输出中 `k`/`v` 是融合张量的切片，batch 维 stride
+  = `(Hq + 2*Hkv) * D`（非连续），而 `update_kv_batch` kernel 按连续布局
+  `b * Hkv * D` 读取 → b>=1 读到 q 区，K/V 写错
+- **修复**（`qwen3/kernels/paged_attention.py`）：`update_kv_batch` 显式接收
+  `k_new`/`v_new` 的 stride（stride(0)/stride(1)），不再假设连续布局
+- **验证**：
+  - 非连续切片单元测试：stride=(4096,128,1)、B=3 逐元素写回一致 PASS
+  - batch=1 调度 vs 串行 generate：24 token 逐 token 一致
+  - 4 请求混批（变长 8/11/14/17）：前 14 token 一致，之后单 token 翻转
+    （批内 eager vs 图完全一致，跨批大小 cuBLAS tile 选择不同 → bf16
+    数值噪声，非 bug）
+  - `test/test_batched.py` 6/6 PASS
+
 
 
 ### 3.12 v3.3 — GPU 采样（batch top-k + Triton Gumbel-max）

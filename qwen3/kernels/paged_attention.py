@@ -301,6 +301,8 @@ def update_kv_batch_kernel(
     layer_idx,           # 当前层号（运行时标量）
     stride_kb_blk, stride_kb_lyr, stride_kb_h, stride_kb_p, stride_kb_d,
     stride_vb_blk, stride_vb_lyr, stride_vb_h, stride_vb_p, stride_vb_d,
+    stride_kn_b, stride_kn_h,   # k_new 的 batch / head 维 stride
+    stride_vn_b, stride_vn_h,   # v_new 的 batch / head 维 stride
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
@@ -313,6 +315,11 @@ def update_kv_batch_kernel(
       - 用 row_ids[b] 从常驻 seq_lens 取 write_pos，从常驻块表取物理页
       - 一次 kernel 同时把该 (b,hkv) 的 K 和 V 写进 k_buffer / v_buffer
     替代 PyTorch advanced indexing（每层 2 次 index_elementwise → 1 次 launch）。
+
+    注意：k_new/v_new 必须是**显式 stride**，不能假设连续布局。
+    v3.2 fused qkv_proj 之后，k/v 是大张量的切片（k 占 q_out 之后的一段），
+    batch 维 stride = (Hq + 2*Hkv) * D 而非 Hkv * D。旧 kernel 按连续布局
+    读取会让 b>=1 的请求读到 q 区（表现：批量 rollout 只有第一条正确，其余乱码）。
     """
     pid = tl.program_id(0)
     b = pid // num_kv_heads
@@ -327,10 +334,10 @@ def update_kv_batch_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     mask_d = offs_d < head_dim
 
-    # k_new (B, Hkv, D) → 本 program 的 (D,)
-    k_in = tl.load(k_new_ptr + b * num_kv_heads * head_dim + hkv * head_dim + offs_d,
+    # k_new (B, Hkv, D) → 本 program 的 (D,)，按真实 stride 寻址
+    k_in = tl.load(k_new_ptr + b * stride_kn_b + hkv * stride_kn_h + offs_d,
                    mask=mask_d, other=0.0)
-    v_in = tl.load(v_new_ptr + b * num_kv_heads * head_dim + hkv * head_dim + offs_d,
+    v_in = tl.load(v_new_ptr + b * stride_vn_b + hkv * stride_vn_h + offs_d,
                    mask=mask_d, other=0.0)
 
     # k_buffer 布局: (num_blocks, num_layers, num_kv_heads, block_size, head_dim)
@@ -348,6 +355,7 @@ def update_kv_batch_triton(k_new, v_new, k_buffer, v_buffer, seq_lens,
     """Triton 批量写 K/V 的 host wrapper
 
     k_new, v_new: (B, num_kv_heads, head_dim) bf16（已 squeeze 掉 S=1 维）
+                  **允许非连续**（fused qkv_proj 的切片），stride 显式传入。
     返回: None（就地写入 pool 的 k_buffer / v_buffer）
     """
     B, num_kv_heads, head_dim = k_new.shape
@@ -362,6 +370,8 @@ def update_kv_batch_triton(k_new, v_new, k_buffer, v_buffer, seq_lens,
         k_buffer.stride(3), k_buffer.stride(4),
         v_buffer.stride(0), v_buffer.stride(1), v_buffer.stride(2),
         v_buffer.stride(3), v_buffer.stride(4),
+        k_new.stride(0), k_new.stride(1),
+        v_new.stride(0), v_new.stride(1),
         num_kv_heads=num_kv_heads, head_dim=head_dim, block_size=block_size,
         max_pages=max_pages, BLOCK_D=BLOCK_D,
     )
