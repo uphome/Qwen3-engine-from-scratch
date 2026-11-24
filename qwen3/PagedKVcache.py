@@ -13,6 +13,8 @@
 """
 
 import torch
+from collections import OrderedDict
+
 from .kernels.paged_attention import update_kv_batch_triton
 
 
@@ -55,6 +57,19 @@ class KVCachePool:
         self.free_block_ids = list(range(num_blocks))
         self.total_blocks = num_blocks
 
+        # ---- 前缀缓存（阶段 1：完全命中）----
+        # block_refs: 每块引用计数（0 = 空闲 / 缓存待用；>0 = 活跃请求持有）
+        # _prefix_index: 块哈希 -> 物理块（只含内容完整、ref 可复用的块）
+        # _block_hashes: 物理块 -> 哈希（淘汰时反向删除索引）
+        # _cached_lru:   ref=0 的可淘汰缓存块（LRU 顺序）
+        self.block_refs = [0] * num_blocks
+        self._prefix_index: dict[int, int] = {}
+        self._block_hashes: dict[int, int] = {}
+        self._cached_lru: OrderedDict[int, None] = OrderedDict()
+        self.max_cached_blocks = max(1, num_blocks // 2)
+        self.prefix_hits = 0          # 完全命中请求数（统计用）
+        self.prefix_hit_blocks = 0    # 复用块数（统计用）
+
     def alloc(self, n: int):
         """从空闲池取出 n 个物理块，返回块 ID 列表
 
@@ -62,6 +77,9 @@ class KVCachePool:
         槽位，若不清零，decode 的 seq_len 增长到未覆盖槽时会读到上一请求的
         残留 KV → 跨请求串扰（vLLM 的 --zero-initialized-kv-cache 同理）。
         首次分配的块在 __init__ 已是 torch.zeros，无需重复清零。
+
+        注意：前缀缓存块**不在** free_block_ids 里（它们保留 K/V 等待复用），
+        所以 alloc 永远不会拿到缓存块，也就不会误清零。
         """
         if len(self.free_block_ids) < n:
             raise RuntimeError(f"OOM: 请求 {n} 块, 剩余 {len(self.free_block_ids)} / {self.total_blocks}")
@@ -70,15 +88,105 @@ class KVCachePool:
         for blk in allocated:
             self.k_buffer[blk].zero_()
             self.v_buffer[blk].zero_()
+            self.block_refs[blk] = 1
         return allocated
 
     def free(self, block_ids: list):
-        """归还物理块"""
+        """归还物理块（立即回空闲池，不做前缀缓存登记）
+
+        普通路径（测试 / 占位句柄 / 哑行）用；请求级释放走
+        PagedKVCache.free() → release_block()（会把完整块登记为缓存）。
+        """
+        for blk in block_ids:
+            self.block_refs[blk] = 0
         self.free_block_ids.extend(block_ids)
 
     @property
     def free_count(self):
         return len(self.free_block_ids)
+
+    # ---- 前缀缓存：匹配 / 引用 / 淘汰 ----
+
+    @property
+    def cached_count(self) -> int:
+        """当前可复用的缓存块数（ref=0，未淘汰）"""
+        return len(self._cached_lru)
+
+    def match_prefix(self, hashes: list[int]) -> list[int] | None:
+        """按哈希序列取缓存块并 ref++
+
+        全部命中才返回块列表；任一缺失返回 None（已取的块自动 release）。
+        命中块从 LRU 淘汰队列移出（被活跃请求使用期间不可淘汰）。
+        """
+        blocks: list[int] = []
+        taken_hashes: list[int] = []
+        for h in hashes:
+            blk = self._prefix_index.get(h)
+            if blk is None:
+                # 部分命中：已取块按"释放"语义恢复缓存（ref-- + 回 LRU）
+                for b, bh in zip(blocks, taken_hashes):
+                    self.release_block(b, bh)
+                return None
+            self.block_refs[blk] += 1
+            self._cached_lru.pop(blk, None)
+            blocks.append(blk)
+            taken_hashes.append(h)
+        return blocks
+
+    def release_block(self, block_id: int, block_hash: int | None = None):
+        """请求释放块：ref--，归零后按规则处理
+
+        - 有哈希（完整 prompt 块）→ 恢复/登记为缓存块（保留 K/V，LRU 可淘汰）
+        - 无哈希（decode 生产块 / 不完整块）→ 清零回空闲池
+
+        注意命中复用的情况：块一直在 `_prefix_index` 里（内容有效），
+        match 时只是从 LRU 队列移出；释放时 ref 归零 → 放回 LRU 即可。
+        """
+        self._release_ref(block_id)
+        if self.block_refs[block_id] > 0:
+            return
+        if block_hash is not None:
+            existing = self._prefix_index.get(block_hash)
+            if existing is None:
+                # 请求自己 prefill 出的新块：登记为缓存
+                self._prefix_index[block_hash] = block_id
+                self._block_hashes[block_id] = block_hash
+                self._cached_lru[block_id] = None
+                self._evict_cache()
+                return
+            if existing == block_id:
+                # 原本就是缓存块（被命中复用）：恢复 LRU 待用
+                self._block_hashes[block_id] = block_hash
+                self._cached_lru[block_id] = None
+                self._evict_cache()
+                return
+            # 同哈希已有另一个缓存块（内容重复）→ 本块直接回收
+        self._clear_and_free(block_id)
+
+    def copy_block(self, src: int, dst: int):
+        """复制物理块全部层 K/V（前缀缓存 COW 用；dst 由 alloc 得到，ref=1）"""
+        self.k_buffer[dst].copy_(self.k_buffer[src])
+        self.v_buffer[dst].copy_(self.v_buffer[src])
+
+    def _release_ref(self, block_id: int):
+        assert self.block_refs[block_id] > 0, \
+            f"块 {block_id} 引用计数为 0，不能 release"
+        self.block_refs[block_id] -= 1
+
+    def _clear_and_free(self, block_id: int):
+        self.k_buffer[block_id].zero_()
+        self.v_buffer[block_id].zero_()
+        self.block_refs[block_id] = 0
+        self.free_block_ids.append(block_id)
+
+    def _evict_cache(self):
+        """LRU 淘汰超出上限的缓存块（清零后回空闲池）"""
+        while len(self._cached_lru) > self.max_cached_blocks:
+            blk, _ = self._cached_lru.popitem(last=False)
+            h = self._block_hashes.pop(blk, None)
+            if h is not None and self._prefix_index.get(h) == blk:
+                del self._prefix_index[h]
+            self._clear_and_free(blk)
 
     # ---- 常驻 2D 块表：行槽位管理 ----
 
@@ -135,6 +243,9 @@ class PagedKVCache:
         self.row_id = pool.alloc_row()
         self.block_table_tensor = pool.block_table_2d[self.row_id]  # (max_pages,) 行视图
         self.num_pages = 0       # 当前已分配的页数（与 len(block_table) 同步）
+        # 与 block_table 对齐的块哈希（仅"完整 prompt 块"有值）：
+        # 请求结束 free 时，有哈希的块登记进前缀缓存（保留 K/V）。
+        self.block_hashes: list[int | None] = []
 
     def _allocate_block(self):
         # 越界保护：超过 max_seq_len 对应的页数说明请求超长，
@@ -145,7 +256,23 @@ class PagedKVCache:
         new = self._pool.alloc(1)
         self.block_table.append(new[0])
         self.block_table_tensor[self.num_pages] = new[0]   # 行视图 → 常驻 2D 表同步写
+        self.block_hashes.append(None)
         self.num_pages += 1
+
+    def bind_prefix(self, block_ids: list[int], hashes: list[int]):
+        """绑定已命中的前缀块（块 ref 已由 pool.match_prefix 增加）
+
+        用于前缀缓存完全命中：请求直接持有这些共享块（只读），
+        seq_len 由调用方设为命中长度；decode 从新块继续写。
+        """
+        assert not self.block_table, "bind_prefix 只能在空块表上调用"
+        assert len(block_ids) == len(hashes)
+        assert len(block_ids) <= self.block_table_tensor.shape[0], "命中块数超过 max_pages"
+        self.block_table = list(block_ids)
+        self.block_hashes = list(hashes)
+        self.num_pages = len(block_ids)
+        for i, blk in enumerate(block_ids):
+            self.block_table_tensor[i] = blk
 
 
     def reserve_next(self):
@@ -218,10 +345,13 @@ class PagedKVCache:
         self._pool.seq_lens[self.row_id] = self.seq_len
 
     def free(self):
-        """归还所有物理块到共享池 + 归还常驻表行号"""
+        """归还所有物理块（完整 prompt 块登记进前缀缓存）+ 归还常驻表行号"""
         if self.block_table:
-            self._pool.free(self.block_table)
+            for i, blk in enumerate(self.block_table):
+                h = self.block_hashes[i] if i < len(self.block_hashes) else None
+                self._pool.release_block(blk, h)
             self.block_table = []
+            self.block_hashes = []
             self.num_pages = 0      # GPU 张量内容无需清零（只读前 num_pages 项）
         self.seq_len = 0
         self._pool.free_row(self.row_id)

@@ -7,6 +7,17 @@
 
 ## 2026-11-24 — 工程化：测试地基 + /metrics + SSE 流式
 
+### 新增：前缀缓存（Prefix Cache，阶段 1：完全命中）
+
+- 块哈希链（`qwen3/prefix_cache.py`）：`h_i = blake2b(h_{i-1}, tokens[块])`
+- 块池状态机：引用计数 + 缓存块（ref=0 保留 K/V）+ LRU 淘汰
+- 完全命中快速路径：块对齐且全部命中 → 跳过 prefill，直接 decode
+- COW 最后一个块（重算 prompt 末 token 的 logits，不写共享块）
+- 实测（0.6B / 256-token prompt）：TTFT **54.8ms → 6.7ms（8.24x）**，输出一致
+- 指标：`engine_prefix_cache_*`（命中数 / 复用块 / 缓存占用）
+- 文档：[PREFIX_CACHE.md](PREFIX_CACHE.md)；测试：`tests/unit/test_prefix_cache.py`（8）
+- 阶段 2（部分命中：后缀 prefill + attention 读历史 KV）待做
+
 ### 新增：pytest 测试体系（61 用例）
 
 - `tests/unit/`（46）：config / rope / kv_pool / request / batch / scheduler /

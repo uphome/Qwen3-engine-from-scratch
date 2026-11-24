@@ -183,6 +183,8 @@ class EngineMetrics:
         self.steps_total = 0          # 调度步数
         self.last_batch_size = 0      # 最近一步批大小
         self.ttfts: deque[float] = deque(maxlen=self.TTFT_WINDOW)
+        self.prefix_cache_hits_total = 0        # 前缀缓存完全命中请求数
+        self.prefix_cache_hit_blocks_total = 0  # 复用的缓存块数
 
 
 class Engine:
@@ -290,7 +292,10 @@ class Engine:
                 request_id=job.request_id, input_ids=job.input_ids,
                 max_new_tokens=job.max_new_tokens, eos_token_id=job.eos_token_id,
             )
-            self.scheduler.add(req)      # 分配 PagedKVCache 行槽位
+            hit_blocks = self.scheduler.add(req)   # 分配行槽位 + 前缀缓存匹配
+            if hit_blocks:
+                self.metrics.prefix_cache_hits_total += 1
+                self.metrics.prefix_cache_hit_blocks_total += hit_blocks
         except RuntimeError as e:
             if track:
                 self.metrics.failed_total += 1
@@ -506,6 +511,18 @@ def render_metrics(engine, model_id: str = "") -> str:
     emit("engine_kv_total_blocks", "gauge",
          "KV 池物理块总数",
          [f"engine_kv_total_blocks {pool.total_blocks}"])
+    emit("engine_prefix_cache_hits_total", "counter",
+         "前缀缓存完全命中的请求数",
+         [f"engine_prefix_cache_hits_total {m.prefix_cache_hits_total}"])
+    emit("engine_prefix_cache_hit_blocks_total", "counter",
+         "复用的缓存块数",
+         [f"engine_prefix_cache_hit_blocks_total {m.prefix_cache_hit_blocks_total}"])
+    emit("engine_prefix_cache_cached_blocks", "gauge",
+         "当前可复用的缓存块数（ref=0）",
+         [f"engine_prefix_cache_cached_blocks {pool.cached_count}"])
+    emit("engine_prefix_cache_capacity_blocks", "gauge",
+         "缓存块上限（LRU 淘汰阈值）",
+         [f"engine_prefix_cache_capacity_blocks {pool.max_cached_blocks}"])
     emit("engine_uptime_seconds", "gauge",
          "进程运行时长（秒）",
          [f"engine_uptime_seconds {time.perf_counter() - m.start_time:.3f}"])

@@ -91,6 +91,12 @@ class Request:
         self.output_ids: list[int] = []   # 已生成的 token 序列（逐步 append，尾部即最新）
         self.num_generated: int = 0       # 已生成 token 数（与 len(output_ids) 同步维护）
         self.state: str = WAITING         # 初始状态：刚创建，等在队列里
+        # 前缀缓存：prompt 完整块的哈希链（Scheduler.add 时计算；
+        # prefill 完成后据此把块登记为可复用缓存）
+        self.prefix_hashes: list[int] = []
+        # 前缀缓存完全命中：首个 decode 输入 = prompt 最后一个 token
+        # （命中跳过 prefill，没有 output_ids，靠它启动自回归）
+        self.prefill_last_token: int | None = None
 
     # ============================================================
     # 状态查询（只读，不修改任何字段）
@@ -116,10 +122,12 @@ class Request:
         """当前 decode 步要送入模型的 token: (1, 1)。
 
         自回归第 n 步的输入 = 上一步采样出的 token（output_ids 的最后一个）。
-        独立成 property 是因为 decode 时模型只吃这 1 个 token，
-        K/V 历史全部从 KV cache 里读，不再重复过模型。
+        前缀缓存完全命中时没有 prefill 采样，第一步 decode 用 prompt
+        最后一个 token（position = L-1，重算该位置得到首 token logits）。
         """
-        return torch.tensor([[self.output_ids[-1]]], device=self.input_ids.device)
+        tok = self.output_ids[-1] if self.output_ids else self.prefill_last_token
+        assert tok is not None, "decode 前既无生成 token 也无 prompt 末 token"
+        return torch.tensor([[tok]], device=self.input_ids.device)
 
     def is_finished(self) -> bool:
         """生成是否结束（三种情况任一即结束）：

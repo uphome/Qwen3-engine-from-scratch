@@ -33,7 +33,8 @@
 - [ ] chunked prefill：长 prompt 切片与 decode 混批
 - [ ] 优先级调度 + 抢占（短请求优先 / 长请求让步）
 - [ ] 精确内存账本 + watermark 水位管理
-- [ ] prefix caching：相同 prompt 前缀块哈希共享
+- [x] prefix caching 阶段 1：块哈希链 + ref/LRU + 完全命中快速路径（TTFT 8.24x）
+- [ ] prefix caching 阶段 2：部分命中（后缀 prefill + attention 读历史 KV）
 
 ### Kernel 层（P2-P3）
 - [ ] split-K decode kernel（页并行，长上下文 SM 利用率）
@@ -85,7 +86,7 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）
 | 调度策略 | 贪心 + FIFO | 优先级队列（公平/吞吐可配）+ 抢占 | 长请求可拖死短请求（无抢占） |
 | 混批 | ❌ prefill 与 decode 不同批 | ✅ chunked prefill：长 prompt 切片与 decode 混批 | 长 prefill 会卡住整个批 |
 | 内存账本 | 只检查 prefill 块数 | 精确的 seq→块映射 + watermark 水位 | 极端负载可能 OOM |
-| 前缀复用 | ❌ | ✅ prefix caching：相同 prompt 前缀块哈希共享 | 多轮对话/system prompt 重复计算 |
+| 前缀复用 | ⏳ 阶段 1：完全命中（块哈希 + ref/LRU） | ✅ prefix caching：任意前缀块共享 | 多轮对话的部分命中待阶段 2 |
 | 换出 (swap) | ❌ | ✅ GPU↔CPU KV 块换出 | 无法超卖显存 |
 | 批成员 | 固定 batch_size 上限 | 动态：完成即出、到达即进 | 相同（我们也有，但无抢占） |
 
@@ -208,7 +209,7 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 算法层差距（较小）:
   - prefill 无 FlashAttention（已融合 v2.1）
   - decode kernel 无 split-K / warp 优化
-  - 无 chunked prefill / prefix caching
+  - 无 chunked prefill / prefix caching 部分命中（阶段 1 完全命中已落地）
 
 工程层差距（v3.0 后已基本消除）:
   - ✅ CUDA Graph：decode 步整图捕获，replay 单次启动（v3.0）
@@ -231,6 +232,8 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P0 | decode 的 cos/sin 移入图 | 省每步 rotary_emb / copy_ | 低 | [x] |
 | P0 | QKV/MLP 投影融合（3→1 kernel） | decode 每 token +4.6%~6.0% | 中 | [x] |
 | P1 | prefill K/V 写入 Triton（变长+跨页） | 消除 PyTorch scatter | 中 | [ ] |
+| P1 | prefix caching 阶段 1（完全命中） | TTFT 54.8 → 6.7ms（8.24x） | 中 | [x] |
+| P1 | prefix caching 阶段 2（部分命中） | 多轮对话：历史前缀复用 | 高 | [ ] |
 | P1 | SSE 流式输出 + 断开取消 | OpenAI 兼容 + TTFT 可测 | 中 | [x] |
 | P1 | `/metrics` 可观测性 | Prometheus 指标（含 TTFT） | 低 | [x] |
 | P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |
@@ -238,7 +241,6 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P2 | chunked prefill 混批 | 长 prompt 不卡批 | 高 | [ ] |
 | P2 | 优先级调度 + 抢占 | 短请求不饿死 | 中 | [ ] |
 | P2 | TP 张量并行 | 权重分卡带宽×N；B=1 通信占比高，大 batch 收益大 | 高 | [ ] |
-| P3 | prefix caching | 多轮对话省 prefill | 高 | [ ] |
 | P3 | fp8 KV cache | 带宽减半 | 中 | [ ] |
 | P3 | 采样进 GPU kernel | batch=28 采样 18.7 → 0.25 ms/step | 中 | [x] |
 | P3 | 换出 (swap) | 显存超卖 | 高 | [ ] |

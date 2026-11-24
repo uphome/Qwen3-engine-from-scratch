@@ -24,6 +24,7 @@ from collections import deque
 import torch
 
 from .batch import Batch
+from .prefix_cache import compute_prefix_hashes
 from .request import Request, WAITING
 from .PagedKVcache import KVCachePool, PagedKVCache
 
@@ -40,7 +41,11 @@ class Scheduler:
     # ---- 入队 ----
 
     def add(self, req: Request):
-        """新请求入队：分配 kv_cache 句柄，检查池剩余块足够 prefill"""
+        """新请求入队：分配 kv_cache 句柄；尝试前缀缓存完全命中
+
+        Returns:
+            命中的缓存块数（0 = 未命中，走正常 prefill）
+        """
         needed = (req.input_len + self.pool.block_size - 1) // self.pool.block_size
         if needed > self.pool.free_count:
             raise RuntimeError(
@@ -48,7 +53,39 @@ class Scheduler:
                 f"请求 {req.request_id} prefill 需要 {needed} 块，拒绝入队")
         req.kv_cache = PagedKVCache(self.pool)
         req.state = WAITING
+
+        # ---- 前缀缓存（阶段 1：完全命中快速路径）----
+        # 条件：prompt 长度是块对齐 + 所有完整块的哈希链全部命中缓存。
+        # 命中后直接绑定共享块、seq_len=prompt 长度，跳过整个 prefill，
+        # 下一步就能参与 decode 批。
+        bs = self.pool.block_size
+        hashes = compute_prefix_hashes(req.input_ids[0].tolist(), bs)
+        req.prefix_hashes = hashes
+        if hashes and req.input_len % bs == 0:
+            blocks = self.pool.match_prefix(hashes)
+            if blocks is not None:
+                # COW 最后一个块：命中请求的第一步 decode 要重算 prompt
+                # 最后一个 token 的 logits（position = L-1，会写该位置 KV），
+                # 共享块不能被写 → 复制末块为私有块，原块保持只读缓存。
+                last, last_hash = blocks[-1], hashes[-1]
+                priv = self.pool.alloc(1)[0]
+                self.pool.copy_block(last, priv)
+                self.pool.release_block(last, last_hash)
+                blocks = blocks[:-1] + [priv]
+                req.kv_cache.bind_prefix(blocks, hashes[:-1] + [None])
+                # 缓存里只剩前 L-1 个 token 的 KV；最后一个 token 走首次 decode
+                req.kv_cache.seq_len = req.input_len - 1
+                self.pool.seq_lens[req.kv_cache.row_id] = req.input_len - 1
+                req.prefill_last_token = int(req.input_ids[0, -1].item())
+                req.start_prefill()
+                req.enter_decoding()
+                self.running.append(req)
+                self.pool.prefix_hits += 1
+                self.pool.prefix_hit_blocks += len(blocks)
+                return len(blocks)
+
         self.waiting.append(req)
+        return 0
 
     def has_pending(self) -> bool:
         """调度循环是否还要继续"""
@@ -99,7 +136,12 @@ class Scheduler:
             req.append(next_tokens[i].item())
 
             if batch.mode == "prefill":
-                # prefill 完成：进入自回归，等待下一批 decode
+                # prefill 完成：记录完整 prompt 块的哈希（free 时登记前缀缓存）
+                cache = req.kv_cache
+                for i, h in enumerate(req.prefix_hashes):
+                    if i < len(cache.block_hashes):
+                        cache.block_hashes[i] = h
+                # 进入自回归，等待下一批 decode
                 req.enter_decoding()
                 self.running.append(req)
             else:
