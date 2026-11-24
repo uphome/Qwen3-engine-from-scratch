@@ -72,7 +72,7 @@ def generate(
 
             if step == 0:
                 # Prefill: 第一次送入完整 prompt，所有 K,V 写入 cache
-                logits = model(generated, kv_cache=kv_cache)
+                logits = model(generated, kv_cache=kv_cache, mode="prefill")
             elif graph_runner is not None and input_ids.is_cuda:
                 # Decode 走 CUDA Graph：replay 替代 model 前向。
                 # 与 run_batched 的 decode 分支契约一致：reserve/advance
@@ -89,7 +89,8 @@ def generate(
                 kv_cache.advance_seq_len(1)      # 状态推进（原 forward 内部做）
             else:
                 # Decode: 只送入最后一个 token，其余 K,V 从 cache 读
-                logits = model(generated[:, -1:], kv_cache=kv_cache)
+                logits = model(generated[:, -1:], kv_cache=kv_cache,
+                               mode="decode")
 
             # CUDA 异步执行：必须同步才能测到真实墙钟（等 GPU 算完）。
             # 不同步的话 perf_counter 只测到"CPU 提交 kernel 的时间"，

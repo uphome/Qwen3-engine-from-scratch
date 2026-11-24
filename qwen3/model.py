@@ -30,13 +30,16 @@ class Qwen3Model(nn.Module):
         )
 
     def forward(self, input_ids: torch.Tensor,
-                kv_cache=None, input_lens: list[int] | None = None) -> torch.Tensor:
+                kv_cache=None, input_lens: list[int] | None = None,
+                mode: str | None = None) -> torch.Tensor:
         """
         input_ids: (batch, seq_len)
         kv_cache: 单个 PagedKVCache（单请求）| list[PagedKVCache]（批）
                   | None。传入则使用 KV cache（prefill 存，decode 读+存）
         input_lens: 批内各请求的有效长度（prefill 批右 pad 后必须传入，
                     否则模型无法知道每请求的真实边界）。decode 批不需要。
+        mode:       "prefill" | "decode" | None（自动推断）。前缀缓存部分命中
+                    的 prefill 后缀也满足 seq_len>0，必须由调度方显式区分。
         returns: logits (batch, seq_len, vocab_size)
 
         批量设计（continuous batching 基础）：
@@ -65,7 +68,14 @@ class Qwen3Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
 
         row_ids = None   # decode 批的常驻 2D 块表行号（prefill/兜底路径不用）
-        if caches is not None and caches[0].seq_len > 0:
+        # decode 判定：显式 mode 优先。前缀缓存部分命中时 prefill 后缀
+        # 也满足 seq_len>0（seq_len = 命中前缀长度），不能只看 seq_len。
+        is_decode = (
+            mode == "decode" if mode is not None else
+            (caches is not None and caches[0].seq_len > 0 and S == 1
+             and input_lens is None)
+        )
+        if caches is not None and is_decode:
             # ---- Decode 模式 ----
             # ① position_ids 必须逐请求独立：
             #    请求 A 缓存了 100 token → 新 token 位置 = 100
@@ -129,8 +139,15 @@ class Qwen3Model(nn.Module):
             lens = input_lens if input_lens is not None else [S] * B
             # repeat 而非 expand：expand 是共享内存视图，逐行写 pad 会
             # 写穿到所有行（短请求的 pad 会把长请求的位置也改成 0）
-            position_ids = torch.arange(S, device=input_ids.device) \
-                .unsqueeze(0).repeat(B, 1)
+            # 位置从各请求自己的前缀偏移开始（前缀缓存部分命中：
+            # 后缀 token 的绝对位置 = 命中长度 + 后缀内偏移）
+            base = torch.arange(S, device=input_ids.device).unsqueeze(0)
+            if caches is not None:
+                offsets = torch.tensor([c.seq_len for c in caches],
+                                       device=input_ids.device).unsqueeze(1)
+                position_ids = base + offsets
+            else:
+                position_ids = base.repeat(B, 1)
             for i, l_i in enumerate(lens):
                 if l_i < S:
                     position_ids[i, l_i:] = 0
@@ -144,7 +161,10 @@ class Qwen3Model(nn.Module):
                 input_ids.is_cuda
                 and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
             )
-            if use_flash:
+            # 有历史 KV（前缀缓存部分命中）时 attention 走 paged prefill，
+            # 自己处理历史 + 后缀的因果 mask，不需要 4D mask。
+            has_history = caches is not None and any(c.seq_len > 0 for c in caches)
+            if use_flash or has_history:
                 causal_mask = None
             else:
                 row = torch.arange(S, device=input_ids.device).view(1, S, 1)       # (1, S, 1)
@@ -160,6 +180,14 @@ class Qwen3Model(nn.Module):
                 causal_mask[valid | pad_keep] = 0
                 causal_mask = causal_mask.unsqueeze(1)   # (B, 1, S, S)
 
+        # 前缀缓存部分命中：层循环前一次性 gather 所有层历史（per 请求）
+        # 逐层 get_kv 会产生 2×L 次 index_select+reshape，CPU 提交成为瓶颈。
+        hist_kv = None
+        if caches is not None and not is_decode:
+            if any(c.seq_len > 0 for c in caches):
+                hist_kv = [c.get_kv_all() if c.seq_len > 0 else None
+                           for c in caches]
+
         # 提前计算 RoPE cos/sin（position_ids 已是逐请求独立的）
         position_embeddings = self.rotary_emb(position_ids)
 
@@ -169,7 +197,7 @@ class Qwen3Model(nn.Module):
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, causal_mask, position_embeddings,
                                   kv_cache=caches, layer_idx=i, input_lens=lens,
-                                  row_ids=row_ids)
+                                  row_ids=row_ids, mode=mode, hist_kv=hist_kv)
 
         # ---- ③ 逐请求推进缓存进度 ----
         # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），
@@ -226,7 +254,8 @@ class Qwen3ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, input_ids: torch.Tensor,
-                kv_cache=None, input_lens: list[int] | None = None) -> torch.Tensor:
+                kv_cache=None, input_lens: list[int] | None = None,
+                mode: str | None = None) -> torch.Tensor:
         """
         input_ids: (batch, seq_len)
         kv_cache: 传入则使用 KV cache（prefill 存，decode 读+存）
@@ -234,7 +263,7 @@ class Qwen3ForCausalLM(nn.Module):
         returns: logits (batch, seq_len, vocab_size)
         """
         hidden_states = self.model(input_ids, kv_cache=kv_cache,
-                                   input_lens=input_lens)
+                                   input_lens=input_lens, mode=mode)
         return self.lm_head(hidden_states)
 
     def forward_decode(self, input_ids: torch.Tensor,

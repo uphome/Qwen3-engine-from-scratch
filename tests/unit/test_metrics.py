@@ -52,7 +52,7 @@ def test_engine_rejects_when_pool_too_small(tiny_model, kv_pool_factory):
         job = make_job(engine, max_new_tokens=64, length=16)   # 需要多页
         engine.submit(job)
         assert job.done.wait(30)
-        assert job.error is not None and "池容量不足" in job.error
+        assert job.error is not None and "拒绝入队" in job.error
         assert engine.metrics.failed_total == 1
         assert engine.metrics.finished_total == 0
     finally:

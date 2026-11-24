@@ -41,13 +41,16 @@ class Qwen3DecoderLayer(nn.Module):
         layer_idx: int = 0,
         input_lens: list[int] | None = None,
         row_ids: torch.Tensor | None = None,   # decode 批常驻 2D 块表行号（每步一次，各层共享）
+        mode: str | None = None,               # "prefill" | "decode" | None（自动推断）
+        hist_kv=None,                          # 前缀缓存：各请求所有层历史 KV
     ) -> torch.Tensor:
         # 自注意力 + 残差
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask,
                                        kv_cache=kv_cache, layer_idx=layer_idx,
-                                       input_lens=input_lens, row_ids=row_ids)
+                                       input_lens=input_lens, row_ids=row_ids,
+                                       mode=mode, hist_kv=hist_kv)
         hidden_states = residual + hidden_states
 
         # MLP + 残差

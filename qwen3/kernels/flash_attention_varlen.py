@@ -26,6 +26,7 @@ import triton.language as tl
 def flash_attention_varlen_kernel(
     Q, K, V, O,
     cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
     scale,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -46,12 +47,18 @@ def flash_attention_varlen_kernel(
     kv_head_idx = off_h // (num_heads // num_kv_heads)
 
     # Load sequence boundaries
-    seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
-    seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
-    seq_len = seq_end - seq_start
+    # q 与 kv 可以有不同长度（前缀缓存：q = 未命中后缀，kv = 历史 + 后缀）
+    q_start = tl.load(cu_seqlens_q_ptr + seq_idx)
+    q_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    q_len = q_end - q_start
+    kv_start = tl.load(cu_seqlens_k_ptr + seq_idx)
+    kv_end = tl.load(cu_seqlens_k_ptr + seq_idx + 1)
+    kv_len = kv_end - kv_start
+    # 后缀在 kv 中的起始偏移（无历史时为 0）
+    q_offset = kv_len - q_len
 
     # Early exit if this block is beyond sequence length
-    if start_m * BLOCK_M >= seq_len:
+    if start_m * BLOCK_M >= q_len:
         return
 
     # Offset for this block of queries
@@ -59,10 +66,10 @@ def flash_attention_varlen_kernel(
     offs_d = tl.arange(0, head_dim)
 
     # Query pointers: Q has shape (total_tokens, num_heads, head_dim)
-    q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
+    q_ptrs = Q + (q_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
 
     # Load Q block - shape (BLOCK_M, head_dim)
-    mask_m = offs_m < seq_len
+    mask_m = offs_m < q_len
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
     # Initialize output accumulators
@@ -70,8 +77,8 @@ def flash_attention_varlen_kernel(
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
     acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
 
-    # Number of blocks to process
-    num_blocks = tl.cdiv(seq_len, BLOCK_N)
+    # Number of blocks to process（按 kv 长度遍历）
+    num_blocks = tl.cdiv(kv_len, BLOCK_N)
 
     # Loop over K, V blocks
     for block_n in range(num_blocks):
@@ -79,10 +86,10 @@ def flash_attention_varlen_kernel(
         offs_n = start_n + tl.arange(0, BLOCK_N)
 
         # Mask for valid positions
-        mask_n = offs_n < seq_len
+        mask_n = offs_n < kv_len
 
         # K pointers: K has shape (total_tokens, num_kv_heads, head_dim)
-        k_ptrs = K + (seq_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
+        k_ptrs = K + (kv_start + offs_n[None, :]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[:, None]
 
         # Load K block - shape (head_dim, BLOCK_N)
         k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
@@ -91,8 +98,8 @@ def flash_attention_varlen_kernel(
         qk = tl.dot(q, k)
         qk = qk * scale
 
-        # Apply causal mask: only attend to positions <= current position
-        mask_causal = (offs_m[:, None] + seq_start) >= (offs_n[None, :] + seq_start)
+        # Apply causal mask: query 的全局 kv 位置 = 后缀偏移 + offs_m
+        mask_causal = (offs_m[:, None] + q_offset) >= offs_n[None, :]
         qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
 
         # Online softmax update
@@ -105,7 +112,7 @@ def flash_attention_varlen_kernel(
         acc = acc * alpha[:, None]
 
         # Load V block - shape (BLOCK_N, head_dim)
-        v_ptrs = V + (seq_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
+        v_ptrs = V + (kv_start + offs_n[:, None]) * num_kv_heads * head_dim + kv_head_idx * head_dim + offs_d[None, :]
         v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
 
         # Accumulate weighted values
@@ -119,7 +126,7 @@ def flash_attention_varlen_kernel(
     acc = acc / l_i[:, None]
 
     # Store output: O has shape (total_tokens, num_heads, head_dim)
-    o_ptrs = O + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
+    o_ptrs = O + (q_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
     tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=mask_m[:, None])
 
 
@@ -132,6 +139,7 @@ def flash_attention_prefill(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    cu_seqlens_k: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Optimized Flash Attention for prefill phase with variable-length sequences.
@@ -140,8 +148,10 @@ def flash_attention_prefill(
         q: (total_tokens, num_heads, head_dim)
         k: (total_tokens, num_kv_heads, head_dim)
         v: (total_tokens, num_kv_heads, head_dim)
-        cu_seqlens: cumulative sequence lengths
+        cu_seqlens: q 的 cumulative sequence lengths
         scale: attention scale factor
+        cu_seqlens_k: k/v 的 cumulative lengths（None = 与 q 相同；
+                      前缀缓存时 kv = 历史 + 后缀 > q）
 
     Returns:
         output: (total_tokens, num_heads, head_dim)
@@ -183,6 +193,7 @@ def flash_attention_prefill(
     flash_attention_varlen_kernel[grid](
         q, k, v, output,
         cu_seqlens,
+        cu_seqlens if cu_seqlens_k is None else cu_seqlens_k,
         scale,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -255,4 +266,65 @@ def flash_attention_prefill_batched(
         out = torch.zeros(B * S, H, D, dtype=q.dtype, device=q.device)
         out[valid] = out_f
         out = out.reshape(B, S, H, D)
+    return out.reshape(B, S, H * D)
+
+
+def flash_attention_prefill_with_history(
+    q, k_new, v_new, lens, hist_kv, scaling, num_heads, num_kv_heads, head_dim
+):
+    """前缀缓存部分命中的 prefill：q = 未命中后缀，KV = 历史 + 后缀
+
+    Args:
+        q:           (B, H, S, D) 后缀 query（右 pad；lens 给出有效长度）
+        k_new/v_new: (B, Hkv, S, D) 后缀 K/V
+        lens:        list[int] 各请求后缀有效长度
+        hist_kv:     list[(k, v)]，每请求历史 (1, Hkv, hist_i, D)（hist_i 可为 0）
+        scaling:     head_dim ** -0.5
+
+    Returns:
+        (B, S, H*D)，与 flash_attention_prefill_batched 一致
+
+    实现：历史 KV（gather 自分页池）与后缀拼接成连续张量，
+    cu_seqlens_q / cu_seqlens_k 分别给出 q / kv 长度，
+    kernel 内 causal 使用 q_offset = kv_len - q_len。
+    """
+    B, H, S, D = q.shape
+    assert len(lens) == B and len(hist_kv) == B
+
+    # ---- 1. q flatten（去 pad）----
+    q2 = q.permute(0, 2, 1, 3).reshape(B * S, H, D)
+    lens_t = torch.tensor(lens, dtype=torch.long, device=q.device)
+    s_idx = torch.arange(S, device=q.device)
+    valid_q = (s_idx[None, :] < lens_t[:, None]).reshape(-1)
+    q_f = q2[valid_q]
+
+    cu_q = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    torch.cumsum(lens_t.to(torch.int32), 0, out=cu_q[1:])
+
+    # ---- 2. KV：历史 + 后缀（逐请求拼接，再 flatten）----
+    k_parts, v_parts, kv_lens = [], [], []
+    for i in range(B):
+        hk, hv = hist_kv[i]
+        li = lens[i]
+        k_parts.append(torch.cat([hk[0], k_new[i, :, :li]], dim=1))
+        v_parts.append(torch.cat([hv[0], v_new[i, :, :li]], dim=1))
+        kv_lens.append(hk.shape[2] + li)
+
+    k_all = torch.cat(k_parts, dim=1)          # (Hkv, total_kv, D)
+    v_all = torch.cat(v_parts, dim=1)
+    k_f = k_all.permute(1, 0, 2).contiguous()  # (total_kv, Hkv, D)
+    v_f = v_all.permute(1, 0, 2).contiguous()
+
+    cu_k = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    torch.cumsum(torch.tensor(kv_lens, dtype=torch.int32, device=q.device),
+                 0, out=cu_k[1:])
+
+    # ---- 3. kernel（q/kv 长度分离）----
+    out_f = flash_attention_prefill(
+        q_f, k_f, v_f, cu_q, scaling, num_heads, num_kv_heads, head_dim,
+        cu_seqlens_k=cu_k)
+
+    # ---- 4. scatter 回 (B, S, H*D) ----
+    out = torch.zeros(B * S, H, D, dtype=q.dtype, device=q.device)
+    out[valid_q] = out_f
     return out.reshape(B, S, H * D)

@@ -19,6 +19,7 @@ Scheduler — continuous batching 的"主动决策者"
 
 from __future__ import annotations
 
+import os
 from collections import deque
 
 import torch
@@ -40,45 +41,45 @@ class Scheduler:
 
     # ---- 入队 ----
 
-    def add(self, req: Request):
-        """新请求入队：分配 kv_cache 句柄；尝试前缀缓存完全命中
+    def add(self, req: Request, reserved_blocks: int = 0) -> int:
+        """新请求入队：分配 kv_cache 句柄；尝试前缀缓存（完全 / 部分命中）
 
+        Args:
+            reserved_blocks: 已入队未归还的块数记账（防批内超卖）
         Returns:
             命中的缓存块数（0 = 未命中，走正常 prefill）
         """
-        needed = (req.input_len + self.pool.block_size - 1) // self.pool.block_size
-        if needed > self.pool.free_count:
-            raise RuntimeError(
-                f"[Scheduler] 池剩余 {self.pool.free_count} 块，"
-                f"请求 {req.request_id} prefill 需要 {needed} 块，拒绝入队")
+        bs = self.pool.block_size
+        needed_total = (req.input_len + bs - 1) // bs
+        # 含 decode 空间的容量需求（预检保护；命中块会从需求中扣除）
+        needed_full = (req.input_len + req.max_new_tokens + bs - 1) // bs
         req.kv_cache = PagedKVCache(self.pool)
         req.state = WAITING
 
-        # ---- 前缀缓存（阶段 1：完全命中快速路径）----
-        # 条件：prompt 长度是块对齐 + 所有完整块的哈希链全部命中缓存。
-        # 命中后直接绑定共享块、seq_len=prompt 长度，跳过整个 prefill，
-        # 下一步就能参与 decode 批。
-        bs = self.pool.block_size
-        hashes = compute_prefix_hashes(req.input_ids[0].tolist(), bs)
+        # 哈希链（QWEN3_PREFIX_CACHE=0 可关闭，消融/对照用）
+        if os.environ.get("QWEN3_PREFIX_CACHE", "1") == "0":
+            hashes: list[int] = []
+        else:
+            hashes = compute_prefix_hashes(req.input_ids[0].tolist(), bs)
         req.prefix_hashes = hashes
-        if hashes and req.input_len % bs == 0:
-            blocks = self.pool.match_prefix(hashes)
-            if blocks is not None:
-                # COW 最后一个块：命中请求的第一步 decode 要重算 prompt
-                # 最后一个 token 的 logits（position = L-1，会写该位置 KV），
-                # 共享块不能被写 → 复制末块为私有块，原块保持只读缓存。
-                last, last_hash = blocks[-1], hashes[-1]
-                try:
-                    priv = self.pool.alloc(1)[0]
-                except RuntimeError:
-                    for b, h in zip(blocks, hashes):
-                        self.pool.release_block(b, h)
-                    raise
+
+        matched = self.pool.match_prefix_partial(hashes)
+        try:
+            # ---- 阶段 1：完全命中（块对齐 + 全部命中）→ 跳过 prefill ----
+            if hashes and len(matched) == len(hashes) and req.input_len % bs == 0:
+                # COW 私有块计为新块：复用块数 = len(matched) - 1
+                if needed_full - (len(matched) - 1) > self.pool.free_count - reserved_blocks:
+                    raise RuntimeError(
+                        f"[Scheduler] 池空闲块不足（{self.pool.free_count} - "
+                        f"已入队 {reserved_blocks}），"
+                        f"无法为 req {req.request_id} 做 COW")
+                # COW 最后一个块：首个 decode 要重算 prompt 末 token 的 logits
+                last, last_hash = matched[-1], hashes[-1]
+                priv = self.pool.alloc(1)[0]
                 self.pool.copy_block(last, priv)
                 self.pool.release_block(last, last_hash)
-                blocks = blocks[:-1] + [priv]
+                blocks = matched[:-1] + [priv]
                 req.kv_cache.bind_prefix(blocks, hashes[:-1] + [None])
-                # 缓存里只剩前 L-1 个 token 的 KV；最后一个 token 走首次 decode
                 req.kv_cache.seq_len = req.input_len - 1
                 self.pool.seq_lens[req.kv_cache.row_id] = req.input_len - 1
                 req.prefill_last_token = int(req.input_ids[0, -1].item())
@@ -87,10 +88,48 @@ class Scheduler:
                 self.running.append(req)
                 self.pool.prefix_hits += 1
                 self.pool.prefix_hit_blocks += len(blocks)
-                return len(blocks)
+                return len(blocks) - 1      # 复用块（COW 私有块算新块）
 
-        self.waiting.append(req)
-        return 0
+            # ---- 阶段 2：部分命中 → 复用前缀块，prefill 只算后缀 ----
+            # 短历史回退：部分命中的固定成本（28 层权重读取 + 小 GEMM）
+            # 在历史较短时高于全量 flash prefill（实测 0.6B/A100 交叉点
+            # ~1k tokens）。低于阈值时释放命中块，走全量 prefill。
+            min_partial = int(os.environ.get("QWEN3_PREFIX_PARTIAL_MIN", "1024"))
+            if matched and len(matched) * bs < min_partial:
+                for b, h in zip(matched, hashes):
+                    self.pool.release_block(b, h)
+                matched = []
+            if matched:
+                new_pages = needed_total - len(matched)
+                if needed_full - len(matched) > self.pool.free_count - reserved_blocks:
+                    raise RuntimeError(
+                        f"[Scheduler] 池剩余 {self.pool.free_count} 块"
+                        f"（已入队 {reserved_blocks}），"
+                        f"req {req.request_id} 命中 {len(matched)} 块后仍需 "
+                        f"{new_pages} 块，拒绝入队")
+                req.kv_cache.bind_prefix(matched, hashes[:len(matched)])
+                offset = len(matched) * bs
+                req.kv_cache.seq_len = offset
+                self.pool.seq_lens[req.kv_cache.row_id] = offset
+                req.prefill_offset = offset
+                self.waiting.append(req)
+                return len(matched)
+
+            # ---- 未命中：普通 prefill ----
+            if needed_full > self.pool.free_count - reserved_blocks:
+                raise RuntimeError(
+                    f"[Scheduler] 池剩余 {self.pool.free_count} 块，"
+                    f"请求 {req.request_id} prefill 需要 {needed_total} 块，拒绝入队")
+            self.waiting.append(req)
+            return 0
+
+        except Exception:
+            # 失败回滚：已匹配块放回缓存 + 归还句柄行（防长期服务槽位泄漏）
+            for b, h in zip(matched, hashes):
+                self.pool.release_block(b, h)
+            if req.kv_cache is not None and not req.kv_cache.block_table:
+                req.kv_cache.free()
+            raise
 
     def has_pending(self) -> bool:
         """调度循环是否还要继续"""

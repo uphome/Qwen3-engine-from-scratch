@@ -43,7 +43,8 @@ class Batch:
         """
         if self.mode == "decode":
             return [1] * self.size
-        return [r.input_len for r in self.requests]
+        # 前缀缓存部分命中：只送未命中后缀，长度 = input_len - prefill_offset
+        return [r.input_len - r.prefill_offset for r in self.requests]
 
     def build_input_ids(self) -> torch.Tensor:
         """批内 input_ids: (B, S)
@@ -54,13 +55,15 @@ class Batch:
         if self.mode == "decode":
             return torch.cat([r.cur_token for r in self.requests], dim=0)
 
-        S_max = max(r.input_len for r in self.requests)
+        # 前缀缓存部分命中：跳过已复用的前缀块，只送后缀
+        parts = [r.input_ids[0, r.prefill_offset:] for r in self.requests]
+        S_max = max(p.shape[0] for p in parts)
         padded = torch.full(
             (self.size, S_max), self.PAD_ID, dtype=torch.long,
             device=self.requests[0].input_ids.device,
         )
-        for i, r in enumerate(self.requests):
-            padded[i, :r.input_len] = r.input_ids[0]
+        for i, p in enumerate(parts):
+            padded[i, :p.shape[0]] = p
         return padded
 
     def build_kv_caches(self) -> list:

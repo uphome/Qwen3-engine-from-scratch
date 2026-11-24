@@ -94,7 +94,8 @@ def main():
         input_ids = batch.build_input_ids()
         kv_caches = batch.build_kv_caches()
         logits = model(input_ids, kv_cache=kv_caches,
-                       input_lens=batch.input_lens)   # 一次 forward 吃整批
+                       input_lens=batch.input_lens,   # 一次 forward 吃整批
+                       mode=batch.mode)
         # 每请求取自己的最后一个位置:
         #   decode 批 S=1 → 位置 0；prefill 批右 pad → 各请求 input_len-1
         last_idx = torch.tensor(batch.input_lens, dtype=torch.long,

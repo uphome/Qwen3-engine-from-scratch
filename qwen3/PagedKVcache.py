@@ -66,7 +66,8 @@ class KVCachePool:
         self._prefix_index: dict[int, int] = {}
         self._block_hashes: dict[int, int] = {}
         self._cached_lru: OrderedDict[int, None] = OrderedDict()
-        self.max_cached_blocks = max(1, num_blocks // 2)
+        # 缓存上限：75% 物理块（留 25% 给活跃请求的 prefill/decode）
+        self.max_cached_blocks = max(1, int(num_blocks * 0.75))
         self.prefix_hits = 0          # 完全命中请求数（统计用）
         self.prefix_hit_blocks = 0    # 复用块数（统计用）
 
@@ -116,25 +117,34 @@ class KVCachePool:
         """当前可复用的缓存块数（ref=0，未淘汰）"""
         return len(self._cached_lru)
 
-    def match_prefix(self, hashes: list[int]) -> list[int] | None:
-        """按哈希序列取缓存块并 ref++
+    def match_prefix_partial(self, hashes: list[int]) -> list[int]:
+        """最长前缀匹配：逐块查，遇到 miss 停止
 
-        全部命中才返回块列表；任一缺失返回 None（已取的块自动 release）。
-        命中块从 LRU 淘汰队列移出（被活跃请求使用期间不可淘汰）。
+        返回已命中的块列表（ref++，从 LRU 移出）。调用方负责：
+          - 全命中 → 阶段 1 快速路径
+          - 部分命中 → 绑定前缀块，prefill 后缀
+          - 放弃使用 → 对每个块 release_block(blk, hashes[i])
         """
         blocks: list[int] = []
-        taken_hashes: list[int] = []
         for h in hashes:
             blk = self._prefix_index.get(h)
             if blk is None:
-                # 部分命中：已取块按"释放"语义恢复缓存（ref-- + 回 LRU）
-                for b, bh in zip(blocks, taken_hashes):
-                    self.release_block(b, bh)
-                return None
+                break
             self.block_refs[blk] += 1
             self._cached_lru.pop(blk, None)
             blocks.append(blk)
-            taken_hashes.append(h)
+        return blocks
+
+    def match_prefix(self, hashes: list[int]) -> list[int] | None:
+        """按哈希序列取缓存块并 ref++（要求全部命中）
+
+        任一缺失返回 None（已取的块自动 release）。
+        """
+        blocks = self.match_prefix_partial(hashes)
+        if len(blocks) != len(hashes):
+            for b, h in zip(blocks, hashes):
+                self.release_block(b, h)
+            return None
         return blocks
 
     def release_block(self, block_id: int, block_hash: int | None = None):
@@ -292,9 +302,27 @@ class PagedKVCache:
             self._allocate_block()
 
     def get_kv(self, layer_idx: int):
-        """读取该层已缓存的所有 K, V"""
+        """读取该层已缓存的所有 K, V → (1, Hkv, seq_len, D)
+
+        GPU 上走"一次高级索引 gather"：k_buffer[ids, layer] 一次取出所有页，
+        再 permute+reshape 成连续序列——替代逐页 Python 循环 + torch.cat
+        （前缀缓存部分命中的 prefill 每层都要读历史，逐页 cat 会产生
+        17×2 次小 kernel，28 层累计上千次，CPU 提交成为瓶颈）。
+        """
         if self.seq_len == 0 or not self.block_table:
             return None, None
+
+        kbuf = self._pool.k_buffer
+        if kbuf.is_cuda:
+            ids = torch.tensor(self.block_table, dtype=torch.long,
+                               device=kbuf.device)
+            k = kbuf[ids, layer_idx]                    # (P, Hkv, BS, D)
+            v = self._pool.v_buffer[ids, layer_idx]
+            k = k.permute(1, 0, 2, 3).reshape(
+                k.shape[1], -1, k.shape[3])[:, :self.seq_len]
+            v = v.permute(1, 0, 2, 3).reshape(
+                v.shape[1], -1, v.shape[3])[:, :self.seq_len]
+            return k.unsqueeze(0), v.unsqueeze(0)
 
         k_pages = [self._pool.k_buffer[pid, layer_idx] for pid in self.block_table]
         v_pages = [self._pool.v_buffer[pid, layer_idx] for pid in self.block_table]
@@ -303,6 +331,26 @@ class PagedKVCache:
         v = torch.cat(v_pages, dim=1)[:, :self.seq_len, :]
 
         return k.unsqueeze(0), v.unsqueeze(0)   # [1, H, seq_len, D]
+
+    def get_kv_all(self):
+        """一次 gather 所有层的 K/V → (num_layers, Hkv, seq_len, D)
+
+        前缀缓存 prefill 每层都要读历史；逐层 gather 会产生 2×L 次
+        index_select + reshape（CPU 提交成为瓶颈）。层循环前一次性取回，
+        每层只做 view 切片。
+        """
+        if self.seq_len == 0 or not self.block_table:
+            return None
+        kbuf = self._pool.k_buffer
+        ids = torch.tensor(self.block_table, dtype=torch.long,
+                           device=kbuf.device)
+        k = kbuf[ids]                        # (P, L, Hkv, BS, D)
+        v = self._pool.v_buffer[ids]
+        L, Hkv, D = k.shape[1], k.shape[2], k.shape[4]
+        seq = self.seq_len
+        k = k.permute(1, 2, 0, 3, 4).reshape(L, Hkv, -1, D)[:, :, :seq]
+        v = v.permute(1, 2, 0, 3, 4).reshape(L, Hkv, -1, D)[:, :, :seq]
+        return k, v
 
     def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor):
         """将新 token 的 K, V 写入页中（向量化，一次写入所有 token）

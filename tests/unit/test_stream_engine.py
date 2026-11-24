@@ -120,7 +120,7 @@ def test_stream_job_rejected_wakes_handler(tiny_model, kv_pool_factory):
         engine.submit(job)
         tok = job.token_queue.get(timeout=30)
         assert tok is None
-        assert job.error is not None and "池容量不足" in job.error
+        assert job.error is not None and "拒绝入队" in job.error
         assert engine.metrics.failed_total == 1
     finally:
         engine.stop()

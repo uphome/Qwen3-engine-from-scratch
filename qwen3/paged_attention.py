@@ -175,3 +175,59 @@ def paged_attention(q, k_new, v_new, kv_cache, layer_idx, attention_mask, scalin
 # （continuous batching / chunked prefill），下一步推荐方向：
 # continuous batching——把串行请求循环变为多请求并发，池子与块表无需改动。
 # ============================================================
+
+
+def paged_attention_prefill(q, k_new, v_new, kv_cache, hist_len, layer_idx,
+                            scaling=1.0):
+    """从 cache 现取历史的版本（测试/兼容用）"""
+    hist_k, hist_v = kv_cache.get_kv(layer_idx)
+    if hist_k is None:
+        hist_k = k_new[:, :, :0]
+        hist_v = v_new[:, :, :0]
+    return paged_attention_prefill_from_history(
+        q, k_new, v_new, hist_k, hist_v, scaling)
+
+
+def paged_attention_prefill_from_history(q, k_new, v_new, hist_k, hist_v,
+                                         scaling=1.0):
+    """前缀缓存部分命中的 prefill attention（q=后缀，KV=历史分页 + 后缀）
+
+    历史场景：请求复用了前 hist_len 个 token 的 KV（块对齐），本次只对
+    未命中后缀做前向。attention 需要让后缀的每个 query 看到：
+      - 全部历史 KV（0 .. hist_len-1）
+      - 后缀内部到自己的因果范围（hist_len .. hist_len+i）
+
+    Args:
+        q:        (1, H, S, D)   后缀 query（已过 QK-Norm + RoPE）
+        k_new/v_new: (1, Hkv, S, D) 后缀 K/V（attention.forward 已调用
+                  kv_cache.update 写入物理页；本函数只读历史部分）
+        hist_k/hist_v: (1, Hkv, hist_len, D) 历史 KV（可来自层外一次性预取）
+        scaling:  head_dim ** -0.5
+    Returns:
+        (1, S, H*D)，尚未过 o_proj
+
+    性能说明：当前是 PyTorch 参考实现（后缀通常很短，先保证正确性）；
+    后续可把分页寻址接进 Triton flash varlen kernel。
+    """
+    assert q.shape[0] == 1, "paged prefill 逐请求调用"
+    B, H, S, D = q.shape
+    Hk = k_new.shape[1]
+    groups = H // Hk
+    hist_len = hist_k.shape[2]
+
+    k_all = torch.cat([hist_k, k_new], dim=2)      # (1, Hk, hist+S, D)
+    v_all = torch.cat([hist_v, v_new], dim=2)
+    k = repeat_kv(k_all, groups)
+    v = repeat_kv(v_all, groups)
+
+    kv_len = hist_len + S
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scaling   # (1,H,S,hist+S)
+
+    # 因果 mask：query 全局位置 hist+i 可见 col <= hist+i
+    row = torch.arange(S, device=q.device).view(1, 1, S, 1) + hist_len
+    col = torch.arange(kv_len, device=q.device).view(1, 1, 1, kv_len)
+    scores = scores.masked_fill(col > row, float("-inf"))
+
+    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    out = torch.matmul(probs, v)                    # (1,H,S,D)
+    return out.transpose(1, 2).reshape(1, S, H * D)

@@ -47,7 +47,9 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 | `tests/unit/test_chat_template.py` | Qwen3 特殊 token、thinking 开关、多轮 | 4 |
 | `tests/unit/test_metrics.py` | Engine 计数/TTFT、容量拒绝计数、Prometheus 格式可解析 | 4 |
 | `tests/unit/test_stream_engine.py` | 流式 token 推送顺序、取消清理/归还、流式==非流式 | 3 |
-| `tests/unit/test_prefix_cache.py` | 块哈希链、完全命中跳过 prefill、COW、引用计数、LRU、池闭环 | 8 |
+| `tests/unit/test_prefix_cache.py` | 块哈希链、完全/部分命中、COW、后缀组装、引用计数、LRU、池闭环 | 9 |
+| `tests/model/test_prefix_prefill.py` | 部分命中 vs 全量 prefill logits（CPU fp32） | 4 |
+| `tests/kernels/test_flash_prefill.py` | flash 普通 varlen / 历史路径（q/kv 长度分离） | 2 |
 | `tests/kernels/test_update_kv_stride.py` | **v3.2 fused-qkv stride bug 回归**：连续/非连续切片、跨页写入 | 3 |
 | `tests/model/test_graph_equivalence.py` | CUDA Graph 图池 vs eager 逐 step logits 一致（bucket 1/2、空槽、池闭环） | 2 |
 | `tests/e2e/test_server_stream.py` | 真实 server SSE：流式==非流式、chunk 格式/usage、断开取消 | 3 |

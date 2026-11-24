@@ -31,9 +31,9 @@ def test_add_rejects_when_pool_too_small(kv_pool_factory):
     pool = kv_pool_factory(num_blocks=1, max_seq_len=64)   # 只够 1 页 = 16 token
     sched = Scheduler(pool, batch_size=1)
 
-    sched.add(make_request(0, 16))                        # 占满 1 页
+    sched.add(make_request(0, 12, max_new=4))             # (12+4)/16 = 1 页
     with pytest.raises(RuntimeError, match="拒绝入队"):
-        sched.add(make_request(1, 17))                    # 需要 2 页
+        sched.add(make_request(1, 17, max_new=4))         # 需要 2 页
 
 
 def test_prefill_batch_size_respects_batch_size(kv_pool_factory):

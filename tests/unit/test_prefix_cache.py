@@ -45,11 +45,12 @@ def test_hash_block_is_stable():
 # 辅助：模拟一次完整 prefill（写页 + 状态收尾）
 # ---------------------------------------------------------------------------
 
-def complete_prefill(sched: Scheduler, req: Request, pool):
-    k = torch.randn(1, pool.num_kv_heads, req.input_len, pool.head_dim)
-    v = torch.randn(1, pool.num_kv_heads, req.input_len, pool.head_dim)
+def complete_prefill(sched: Scheduler, req: Request, pool, write_len: int | None = None):
+    n = req.input_len if write_len is None else write_len
+    k = torch.randn(1, pool.num_kv_heads, n, pool.head_dim)
+    v = torch.randn(1, pool.num_kv_heads, n, pool.head_dim)
     req.kv_cache.update(0, k, v)
-    req.kv_cache.advance_seq_len(req.input_len)
+    req.kv_cache.advance_seq_len(n)
     req.start_prefill()          # 模拟被调度器选中（waiting → prefilling）
     sched.on_step_done(Batch("prefill", [req]), torch.tensor([[1]]))
 
@@ -86,7 +87,7 @@ def test_full_hit_skips_prefill_and_shares_blocks(kv_pool_factory):
 
     b = make_req(1, ids)
     hit = sched.add(b)
-    assert hit == 2                            # 完全命中
+    assert hit == 1                            # 完全命中（2 块共享，COW 私有块算新块）
     assert b.state == DECODING                 # 跳过 prefill，直接进入 decode
     assert len(sched.running) == 1
     # 缓存里只保留前 L-1 个 token；最后一个 token 走首次 decode（重算 logits）
@@ -126,9 +127,9 @@ def test_ref_count_while_shared_by_active_request(kv_pool_factory):
     finish_req(sched, a)                                 # 登记缓存，ref=0
 
     b = make_req(1, ids)
-    assert sched.add(b) == 2                   # 命中（末块 COW）
+    assert sched.add(b) == 1                   # 命中（末块 COW 计新块）
     c = make_req(2, ids)
-    assert sched.add(c) == 2                   # 同时命中 → 共享首块 ref=2
+    assert sched.add(c) == 1                   # 同时命中 → 共享首块 ref=2
     shared0 = b.kv_cache.block_table[0]
     assert c.kv_cache.block_table[0] == shared0
     assert pool.block_refs[shared0] == 2
@@ -144,7 +145,9 @@ def test_ref_count_while_shared_by_active_request(kv_pool_factory):
     assert pool.free_count + pool.cached_count == pool.total_blocks
 
 
-def test_unaligned_prompt_not_hit(kv_pool_factory):
+def test_unaligned_prompt_partial_hit(kv_pool_factory, monkeypatch):
+    """阶段 2：前缀命中 2 块，尾部 4 token 走 prefill（只送后缀）"""
+    monkeypatch.setenv("QWEN3_PREFIX_PARTIAL_MIN", "0")
     pool = kv_pool_factory(num_blocks=16, max_seq_len=64)
     sched = Scheduler(pool, batch_size=2)
 
@@ -153,18 +156,30 @@ def test_unaligned_prompt_not_hit(kv_pool_factory):
     sched.add(a)
     complete_prefill(sched, a, pool)
     finish_req(sched, a)
+    cached_blocks = list(pool._cached_lru.keys())
 
-    # 36 tokens：前 2 块与缓存相同，但长度非块对齐 → 阶段 1 不命中
     b = make_req(1, ids + [100, 101, 102, 103])
-    assert sched.add(b) == 0
-    assert b.state == WAITING
-    assert b.kv_cache.block_table == []
-    # 匹配到的块已释放回缓存，引用计数归零
-    assert pool.cached_count == 2
-    assert all(r == 0 for r in pool.block_refs)
+    assert sched.add(b) == 2
+    assert b.state == WAITING                   # 进入 prefill 批
+    assert b.prefill_offset == 32
+    assert b.kv_cache.seq_len == 32
+    assert b.kv_cache.num_pages == 2
+    assert b.kv_cache.block_table == cached_blocks
+    assert all(pool.block_refs[blk] == 1 for blk in cached_blocks)
+
+    batch = Batch("prefill", [b])
+    assert batch.input_lens == [4]              # 只送未命中后缀
+    assert batch.build_input_ids().tolist() == [[100, 101, 102, 103]]
+
+    # 模拟 prefill 后缀（只写 4 个 token）后完成
+    complete_prefill(sched, b, pool, write_len=4)
+    finish_req(sched, b)
+    assert pool.free_count + pool.cached_count == pool.total_blocks
 
 
-def test_different_prefix_not_hit(kv_pool_factory):
+def test_different_second_block_partial_hit(kv_pool_factory, monkeypatch):
+    """第 2 块不同 → 只命中第 1 块（最长前缀匹配），后缀从 16 开始"""
+    monkeypatch.setenv("QWEN3_PREFIX_PARTIAL_MIN", "0")
     pool = kv_pool_factory(num_blocks=16, max_seq_len=64)
     sched = Scheduler(pool, batch_size=2)
 
@@ -173,16 +188,35 @@ def test_different_prefix_not_hit(kv_pool_factory):
     complete_prefill(sched, a, pool)
     finish_req(sched, a)
 
-    # 第 2 块内容不同 → 只命中第 1 块，阶段 1 整体不命中
     b = make_req(1, list(range(16)) + [1000 + i for i in range(16)])
+    assert sched.add(b) == 1
+    assert b.state == WAITING
+    assert b.prefill_offset == 16
+    assert b.kv_cache.seq_len == 16
+    assert b.kv_cache.num_pages == 1
+    assert pool.cached_count == 1               # 命中的块被请求持有（移出 LRU）
+
+
+def test_no_prefix_miss(kv_pool_factory):
+    """首块就不同 → 完全未命中，普通 prefill"""
+    pool = kv_pool_factory(num_blocks=16, max_seq_len=64)
+    sched = Scheduler(pool, batch_size=2)
+
+    a = make_req(0, list(range(32)))
+    sched.add(a)
+    complete_prefill(sched, a, pool)
+    finish_req(sched, a)
+
+    b = make_req(1, [9000 + i for i in range(32)])
     assert sched.add(b) == 0
     assert b.state == WAITING
-    assert pool.cached_count == 2
+    assert b.prefill_offset == 0
+    assert b.kv_cache.num_pages == 0
 
 
 def test_lru_eviction(kv_pool_factory):
-    pool = kv_pool_factory(num_blocks=8, max_seq_len=64)   # 缓存上限 = 4 块
-    assert pool.max_cached_blocks == 4
+    pool = kv_pool_factory(num_blocks=8, max_seq_len=64)
+    pool.max_cached_blocks = 4          # 显式限制，构造淘汰场景
     sched = Scheduler(pool, batch_size=1)
 
     prompts = [[1000 * i + j for j in range(16)] for i in range(5)]
@@ -199,10 +233,11 @@ def test_lru_eviction(kv_pool_factory):
     # 最旧的 prompt 已淘汰 → 重新请求不命中
     old = make_req(99, prompts[0])
     assert sched.add(old) == 0
-    # 最新一个仍命中
+    # 最新一个仍命中（单块 prompt：唯一块被 COW 复制，共享复用块数 = 0）
     newest = make_req(100, prompts[-1])
-    assert sched.add(newest) == 1
-    newest.finish()
+    assert sched.add(newest) == 0
+    assert newest.state == DECODING
+    finish_req(sched, newest)
 
 
 def test_pool_accounting_after_mixed_traffic(kv_pool_factory):
@@ -217,7 +252,7 @@ def test_pool_accounting_after_mixed_traffic(kv_pool_factory):
 
     for i in range(3):
         b = make_req(10 + i, shared)
-        assert sched.add(b) == 2      # 命中：跳过 prefill，直接 decode
+        assert sched.add(b) == 1      # 命中：跳过 prefill，直接 decode
         finish_req(sched, b)
 
     assert pool.free_count + pool.cached_count == pool.total_blocks

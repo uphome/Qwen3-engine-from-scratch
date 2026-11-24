@@ -1,7 +1,7 @@
 # 前缀缓存（Prefix Cache / 哈希 KV 复用）
 
 > 目标：让 **KV cache 在不同对话/请求之间复用**——相同前缀不再重复 prefill。
-> 本文记录设计与实现（阶段 1：完全命中），阶段 2（部分命中）见文末计划。
+> 当前状态：**阶段 1（完全命中）+ 阶段 2（部分命中）已落地**。
 
 ---
 
@@ -11,11 +11,10 @@
 相同前缀。没有前缀缓存时，每个请求都要把整个 prompt 重新算一遍
 （prefill），而 prefill 通常是首 token 延迟（TTFT）的主要来源。
 
-目标效果：
-
 ```
-请求 A: [system prompt 256 tokens][user msg]  → prefill 全部 268 tokens
-请求 B: [system prompt 256 tokens][user msg2] → 复用前 256 tokens 的 KV
+请求 A: [system prompt 2048 tokens][user msg]  → prefill 全部 2064 tokens
+请求 B: [system prompt 2048 tokens][user msg2] → 复用前 2048 tokens 的 KV，
+                                                 只 prefill 后缀 16 tokens
 ```
 
 ---
@@ -40,7 +39,7 @@ h_2 = blake2b(parent=h_1,  tokens[32:48])
 
 ### 2.2 块池：空闲 / 缓存 / 引用计数
 
-`KVCachePool` 的物理块现在有三种状态：
+`KVCachePool` 的物理块有三种状态：
 
 ```
 free_block_ids          空闲块（内容已清零，可分配）
@@ -59,80 +58,121 @@ block_refs[blk]          引用计数（活跃请求持有 > 0）
 | 请求释放块（无 hash） | 清零回 free（decode 生产块） |
 | 缓存超上限 | LRU 淘汰最旧块：删除 hash 索引 + 清零回 free |
 
-缓存上限：`max_cached_blocks = num_blocks // 2`（阶段 1 固定）。
+缓存上限：`max_cached_blocks = 75% × num_blocks`（留 25% 给活跃请求）。
 
-### 2.3 完全命中流程（阶段 1）
+### 2.3 完全命中（阶段 1）
 
-命中条件：**prompt 长度块对齐**（`len % 16 == 0`）且所有完整块哈希全部命中。
+条件：**prompt 长度块对齐**且所有完整块哈希全部命中。
 
 ```
 Scheduler.add(req)
-   │  compute_prefix_hashes(prompt)
-   │  pool.match_prefix(hashes)          # 全部命中 → ref++
-   ├─ 未命中 → waiting（普通 prefill，prefill 完成后登记块哈希）
-   └─ 命中 →
-        COW 最后一个块：alloc 私有块 + copy_block + release 原块
-        bind_prefix(blocks[:-1] + [私有块])
-        seq_len = L - 1                   # 最后一个 token 待重算
-        state = decoding                  # 跳过 prefill
-        running.append(req)
+   │  match_prefix_partial(hashes)       # ref++
+   ├─ 全部命中且对齐 → COW 最后一个块 → seq_len = L-1 → 直接 decode
+   └─ 否则 → 部分命中 / 普通 prefill
 ```
 
-### 2.4 为什么需要 COW + seq_len = L-1
+**为什么 COW + seq_len = L-1**：缓存里没有保存 prompt 最后一个 token 的
+logits，而第一个生成 token 由它决定。所以只复用前 L-1 个 token 的 KV，
+第一次 decode 用 `prompt[L-1]`（position = L-1）重算该位置；这次会写
+position L-1 的 K/V，必须写**私有块**（复制末块，约 18MB，~10µs）。
 
-完全命中时缓存里已有 `L` 个 token 的 KV，但**最后一个 prompt token 的
-logits 没有保存**（prefill 时算过但没留下），而第一个生成 token 正是由
-它决定的。所以：
+### 2.4 部分命中（阶段 2）
 
-1. 逻辑上只复用前 `L-1` 个 token 的 KV（`seq_len = L-1`）
-2. 第一次 decode 输入 `prompt[L-1]`（`Request.prefill_last_token`），
-   position = `L-1`，重算该位置得到首 token
-3. 这次 decode 会写 position `L-1` 的 K/V → 必须写**私有块**，
-   因此把最后一个共享块复制一份（COW，单块约 18MB，~10µs）
-4. 首 token 产出后 `seq_len` 回到 `L`，后续全部走正常 decode
-
-这样既不用改 attention（decode kernel 本来就支持读历史 paged KV），
-也保证了共享块永远只读。
-
-### 2.5 生命周期示例
+条件：最长前缀命中 `matched` 个完整块（`matched_tokens = 16 × n`），
+且 `matched_tokens ≥ QWEN3_PREFIX_PARTIAL_MIN`（默认 1024，见 2.6）。
 
 ```
-A: add(prompt) → prefill 写入 2 块 → decode → finish
-   → 2 块登记缓存（cached=2, free=14）
-
-B: add(相同 prompt)
-   → match 2 块（ref=1）
-   → COW 末块（alloc 1, copy, release 原块 → 回缓存）
-   → seq_len=31，直接进 running（跳过 prefill）
-   → 首 decode 重算第 32 个 token → 后续正常
-   → finish：共享块回缓存、COW 副本清零回 free
+Scheduler.add(req)
+   ├─ bind_prefix(matched)             # 共享前缀块（ref++）
+   ├─ cache.seq_len = matched_tokens   # GPU seq_lens 同步
+   ├─ req.prefill_offset = matched_tokens
+   └─ 进入 waiting → prefill 批只送 input_ids[:, offset:]
 ```
+
+后续链路自动衔接：
+
+| 环节 | 改动 |
+|---|---|
+| `Batch.build_input_ids` | prefill 只取 `input_ids[:, prefill_offset:]`，右 pad |
+| `Batch.input_lens` | 返回后缀长度（模型按它推进 seq_len） |
+| `model.forward` | 显式 `mode` 判定（后缀 S=1 也不能误判 decode）；position_ids = `offset + arange(S)`；层前一次性预取历史 KV |
+| `attention`（prefill） | 有历史 → `paged_attention_prefill_from_history`：q=后缀，K/V = 历史 + 后缀，因果 mask 按全局位置（`offset + i`） |
+| `get_kv_all` | 一次 gather 所有层历史（逐层 gather 会产生 2×28 次小算子，CPU 提交瓶颈） |
+
+**KV 写入**：`PagedKVCache.update` 从 `seq_len = matched_tokens` 开始写新块，
+共享前缀块保持只读；decode 从 L 继续写新块。
+
+### 2.5 生命周期示例（部分命中）
+
+```
+A: prompt 2048（128 块）→ prefill → decode → finish
+   → 128 块登记缓存（cached=128）
+
+B: prompt = A 的 prompt + 16 新 token（129 块）
+   → 最长前缀命中 128 块（ref++）
+   → prefill 只算 16 个后缀 token（position 2048..2063）
+   → decode 正常
+   → finish：共享块回缓存，后缀块按 hash 规则处理
+```
+
+### 2.6 短历史回退阈值（工程取舍）
+
+部分命中的固定成本 = 28 层权重读取 + 每层小 GEMM / attention 算子
+（实测约 35ms）。历史较短时，全量 flash prefill 反而更快：
+
+| 历史 tokens | 全量 prefill | 部分命中 | 加速 |
+|---:|---:|---:|---:|
+| 128 | 34.1 ms | 35.5 ms | 0.96x |
+| 272 | 33.8 ms | 36.1 ms | 0.94x |
+| 512 | 34.9 ms | 37.1 ms | 0.94x |
+| 1024 | 36.2 ms | 34.7 ms | 1.04x |
+| 2048 | 57.1 ms | 36.4 ms | **1.57x** |
+
+（Qwen3-0.6B / A100 / 后缀 16 tokens / bf16）
+
+所以默认阈值 `QWEN3_PREFIX_PARTIAL_MIN=1024`：命中前缀低于 1024 token 时
+释放命中块、回退全量 prefill，避免负收益；可通过环境变量调整（0 = 总是启用）。
 
 ---
 
 ## 3. 实测（Qwen3-0.6B，A100，CUDA Graph decode）
 
+### 3.1 完全命中（阶段 1）
+
 同一 256-token prompt（块对齐），贪心 16 tokens：
 
 | 请求 | 路径 | TTFT | 输出 |
 |---|---|---|---|
-| A（冷启动） | prefill 256 tokens + decode | 54.8 ms | ✓ |
-| B（完全命中） | 跳过 prefill，直接 decode | **6.7 ms** | 与 A 完全一致 |
+| A（冷启动） | prefill 256 + decode | 54.8 ms | ✓ |
+| B（完全命中） | 跳过 prefill，直接 decode | **6.7 ms** | 与 A 一致 |
 | | | **8.24x** | 命中 16 块 |
 
-池闭环：`free=46 + cached=16 = 62 = 64 - 2`（2 块为 CUDA Graph 占位 + 哑行）。
+### 3.2 部分命中（阶段 2）
 
-> 复现脚本：`/tmp/opencode/verify_prefix_cache.py`（本地验证用，未入库）
+2048-token 前缀 + 16-token 后缀（模拟多轮对话），贪心 8 tokens：
+
+| 请求 | 路径 | TTFT |
+|---|---|---|
+| A（冷启动） | 全量 prefill 2048 | 117 ms（含首次编译） |
+| B（部分命中 2048/2064） | prefill 16 后缀 | **40.1 ms** |
+| C（关闭缓存，全量 2064） | 全量 prefill | 59.8 ms |
+
+**B vs C = 1.49x**；命中 128 块。
+
+> 输出一致性说明：B 与 C 前 5 个 token 相同，第 5 个翻转。原因是
+> bf16 下不同 attention 实现（PyTorch 历史拼接 vs flash 全量）的
+> 数值差异累积，**不是逻辑错误**；CPU fp32 精确测试（全量 vs 部分命中）
+> max diff < 1e-4、argmax 完全一致（见 `tests/model/test_prefix_prefill.py`）。
 
 ---
 
 ## 4. 可观测性
 
-`GET /metrics` 新增：
+`GET /metrics`（`engine_prefix_cache_*`）：
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
-| `engine_prefix_cache_hits_total` | counter | 完全命中请求数 |
+| `engine_prefix_cache_hits_total` | counter | 实际复用的命中请求数 |
 | `engine_prefix_cache_hit_blocks_total` | counter | 复用块数 |
 | `engine_prefix_cache_cached_blocks` | gauge | 当前可复用缓存块（ref=0） |
 | `engine_prefix_cache_capacity_blocks` | gauge | 缓存上限（LRU 阈值） |
@@ -141,47 +181,36 @@ B: add(相同 prompt)
 
 ## 5. 测试
 
-`tests/unit/test_prefix_cache.py`（8 个用例）：
-
-- 哈希链：前缀相同后块一致、差异块发散、非对齐只算完整块
-- 完全命中：跳过 prefill、块共享、COW 私有块、`seq_len=L-1`、首 token 输入
-- 引用计数：两个请求同时命中，一方结束不回收块
-- 部分命中 / 不同前缀：不命中且已取块正确归还
-- LRU 淘汰：5 个块争 4 个缓存位，最旧淘汰后不再命中
-- 混合流量池闭环：`free + cached == total`
+| 文件 | 覆盖 |
+|---|---|
+| `tests/unit/test_prefix_cache.py`（9） | 哈希链、完全命中/COW、部分命中/后缀组装、ref 共享、LRU、池闭环 |
+| `tests/model/test_prefix_prefill.py`（4） | 部分命中 vs 全量 prefill logits（CPU fp32，含 1-token 后缀） |
+| `tests/kernels/test_flash_prefill.py`（2, gpu） | flash 普通 varlen / 历史路径（q/kv 长度分离）数值正确性 |
 
 ---
 
-## 6. 边界与限制（阶段 1）
+## 6. 边界与限制
 
-| 限制 | 说明 | 阶段 2 |
-|---|---|---|
-| 只支持**完全命中** | prompt 必须块对齐且全部命中 | 部分命中：复用前 N 块，后缀重新 prefill |
-| 不省 prefill 的**部分**场景 | 如多轮对话（历史前缀 + 新消息） | 核心收益场景 |
-| 缓存上限固定 | `num_blocks // 2` | 可配置 / 按命中率自适应 |
-| 无跨进程持久化 | 缓存随进程生命周期 | 可选：磁盘 KV 持久化 |
-| COW 开销 | 每次命中复制 1 个块（~18MB） | 可改为仅重算最后一个 token 不写 KV |
-| 仅 Scheduler/server 路径 | `generate()`（main.py 单请求）不走 Scheduler，不查缓存；请求结束仍会登记块（受 LRU 上限约束） | 可选：generate 接入查询 |
+| 限制 | 说明 |
+|---|---|
+| 部分命中的性能依赖长历史 | 阈值默认 1024；短历史自动回退全量（避免负收益） |
+| LRU 淘汰可能切断前缀链 | 缓存上限 75%；长前缀超出容量时可能淘汰链头导致命中变短（阶段 3 可做链感知淘汰） |
+| 容量记账 | 命中块从新块需求中扣除；完全命中时 COW 私有块计为新块 |
+| 无跨进程持久化 | 缓存随进程生命周期 |
+| `generate()` 单请求路径 | 不走 Scheduler，不查缓存（请求结束仍登记块，受 LRU 上限约束） |
+| 数值 | 前缀复用不保证 bit 级输出一致（bf16 不同 attention 实现） |
 
 ---
 
-## 7. 阶段 2 计划（部分命中）
+## 7. 阶段 3（可选优化）
 
-目标场景：多轮对话——`system + 历史对话` 是前缀，新用户消息是后缀。
-
-需要：
-
-1. **prefill 只送未命中后缀**：`input_ids[:, matched:]`，position 从
-   `matched` 开始（RoPE 表天然支持任意位置）
-2. **prefill attention 读历史 KV**：当前 `flash_attention_prefill_batched`
-   只计算当前输入的 K/V。需要支持
-   `q = 后缀, k/v = 历史 paged KV + 当前后缀`：
-   - 先做 PyTorch 参考实现（正确性）
-   - 再把分页寻址接入 Triton flash varlen kernel（性能）
-3. **块对齐**：`matched = floor(prefix_len / 16) * 16`，尾部重新计算
-4. **验收**：第二轮对话 TTFT 显著下降；输出与无缓存一致；命中率 / 池闭环
-
-预计工作量：2-3 天（kernel 占一半）。
+1. **链感知 LRU**：优先淘汰链尾（无子块）而非链头，避免长前缀被切断
+2. **Triton 历史 kernel 接入**：`flash_attention_prefill_with_history` 已实现
+   并通过数值测试；当前 q 很小（16）时 cuBLAS 的 PyTorch 路径更快，
+   大后缀 / 大模型场景可切换
+3. **部分命中指标**：`partial_hits` / 回退计数，便于观察阈值效果
+4. **chunked prefill 协同**：长后缀切片与 decode 混批
+5. **跨进程持久化**：磁盘 KV（多级缓存）
 
 ---
 
@@ -192,9 +221,10 @@ B: add(相同 prompt)
 | 块哈希 | 链式 blake2b（16 字节） | 链式 hash |
 | 共享粒度 | 16-token 块（对齐） | block（默认 16） |
 | 引用计数 + LRU | ✅ | ✅ |
-| 完全命中复用 | ✅ 阶段 1 | ✅ |
-| 部分命中（chunked prefix） | ⏳ 阶段 2 | ✅ |
-| COW 末块 | ✅（命中路径） | ✅（copy-on-write 块） |
+| 完全命中复用 | ✅ | ✅ |
+| 部分命中（前缀 + 后缀） | ✅（PyTorch attention） | ✅（flash 内建 prefix） |
+| COW 末块 | ✅（完全命中） | ✅ |
+| 链感知淘汰 | ⏳ | 部分（引用计数 + LRU） |
 | KV 持久化 | ❌ | ✅（多级缓存） |
 
 ---
@@ -203,9 +233,13 @@ B: add(相同 prompt)
 
 | 文件 | 内容 |
 |---|---|
-| `qwen3/prefix_cache.py` | 块哈希链（`hash_block` / `compute_prefix_hashes`） |
-| `qwen3/PagedKVcache.py` | 块池状态机（ref / 缓存 / LRU / COW） |
-| `qwen3/scheduler.py` | 命中判定、跳过 prefill、块哈希登记 |
-| `qwen3/request.py` | `prefix_hashes` / `prefill_last_token` |
+| `qwen3/prefix_cache.py` | 块哈希链 |
+| `qwen3/PagedKVcache.py` | 块池状态机（ref / 缓存 / LRU / COW / `get_kv_all`） |
+| `qwen3/scheduler.py` | 最长前缀匹配、完全/部分命中、阈值回退 |
+| `qwen3/request.py` | `prefix_hashes` / `prefill_offset` / `prefill_last_token` |
+| `qwen3/batch.py` | prefill 后缀组装 |
+| `qwen3/model.py` | `mode` 判定、position offset、历史预取 |
+| `qwen3/attention.py` | prefill 历史 attention 路径 |
+| `qwen3/paged_attention.py` | `paged_attention_prefill_from_history` |
+| `qwen3/kernels/flash_attention_varlen.py` | q/kv 长度分离的 flash kernel（阶段 3 用） |
 | `server.py` | 命中指标（`/metrics`） |
-| `tests/unit/test_prefix_cache.py` | 8 个用例 |

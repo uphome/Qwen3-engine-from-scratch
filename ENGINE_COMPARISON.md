@@ -34,7 +34,7 @@
 - [ ] 优先级调度 + 抢占（短请求优先 / 长请求让步）
 - [ ] 精确内存账本 + watermark 水位管理
 - [x] prefix caching 阶段 1：块哈希链 + ref/LRU + 完全命中快速路径（TTFT 8.24x）
-- [ ] prefix caching 阶段 2：部分命中（后缀 prefill + attention 读历史 KV）
+- [x] prefix caching 阶段 2：部分命中（后缀 prefill + attention 读历史 KV，TTFT 1.5x @2k）
 
 ### Kernel 层（P2-P3）
 - [ ] split-K decode kernel（页并行，长上下文 SM 利用率）
@@ -86,7 +86,7 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）
 | 调度策略 | 贪心 + FIFO | 优先级队列（公平/吞吐可配）+ 抢占 | 长请求可拖死短请求（无抢占） |
 | 混批 | ❌ prefill 与 decode 不同批 | ✅ chunked prefill：长 prompt 切片与 decode 混批 | 长 prefill 会卡住整个批 |
 | 内存账本 | 只检查 prefill 块数 | 精确的 seq→块映射 + watermark 水位 | 极端负载可能 OOM |
-| 前缀复用 | ⏳ 阶段 1：完全命中（块哈希 + ref/LRU） | ✅ prefix caching：任意前缀块共享 | 多轮对话的部分命中待阶段 2 |
+| 前缀复用 | ✅ 完全 + 部分命中（块哈希 + ref/LRU + 后缀 prefill） | ✅ prefix caching：任意前缀块共享 | 长历史收益显著，短历史自动回退 |
 | 换出 (swap) | ❌ | ✅ GPU↔CPU KV 块换出 | 无法超卖显存 |
 | 批成员 | 固定 batch_size 上限 | 动态：完成即出、到达即进 | 相同（我们也有，但无抢占） |
 
@@ -233,7 +233,7 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P0 | QKV/MLP 投影融合（3→1 kernel） | decode 每 token +4.6%~6.0% | 中 | [x] |
 | P1 | prefill K/V 写入 Triton（变长+跨页） | 消除 PyTorch scatter | 中 | [ ] |
 | P1 | prefix caching 阶段 1（完全命中） | TTFT 54.8 → 6.7ms（8.24x） | 中 | [x] |
-| P1 | prefix caching 阶段 2（部分命中） | 多轮对话：历史前缀复用 | 高 | [ ] |
+| P1 | prefix caching 阶段 2（部分命中） | 多轮对话：历史前缀复用（59.8→40.1ms） | 高 | [x] |
 | P1 | SSE 流式输出 + 断开取消 | OpenAI 兼容 + TTFT 可测 | 中 | [x] |
 | P1 | `/metrics` 可观测性 | Prometheus 指标（含 TTFT） | 低 | [x] |
 | P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |

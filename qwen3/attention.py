@@ -23,7 +23,10 @@ import torch.nn.functional as F
 from .norm import RMSNorm
 from .rope import apply_rotary_pos_emb
 from .PagedKVcache import PagedKVCache
-from .paged_attention import paged_attention
+from .paged_attention import (
+    paged_attention,
+    paged_attention_prefill_from_history,
+)
 from .kernels.paged_attention import triton_paged_attention_decode, triton_paged_attention_decode_batch
 from .kernels.flash_attention_varlen import flash_attention_prefill_batched
 
@@ -70,6 +73,8 @@ class Qwen3Attention(nn.Module):
         layer_idx: int = 0,                      # 当前是第几层
         input_lens: list[int] | None = None,     # prefill 批各请求有效长度（flash 路径用）
         row_ids: torch.Tensor | None = None,     # decode 批常驻 2D 块表行号（每步组装一次）
+        mode: str | None = None,                 # "prefill" | "decode" | None（自动推断）
+        hist_kv=None,                            # 前缀缓存：各请求 (k_all, v_all)
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
@@ -96,25 +101,37 @@ class Qwen3Attention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # KV cache: 分页则走 PagedAttention（逐物理页计算，不重建连续 K/V）
+        # decode 判定：显式 mode 优先（前缀缓存部分命中时，prefill 后缀也
+        # 可能 S==1 且 seq_len>0，不能只看 S/seq_len）
         if isinstance(kv_cache, PagedKVCache):
             # 环境变量 QWEN3_PAGED_ATTN=pytorch 可强制走 PyTorch 版（消融对比用）
+            is_decode = (
+                mode == "decode" if mode is not None else
+                (S == 1 and kv_cache.seq_len > 0)
+            )
             use_triton = (
-                S == 1 and kv_cache.seq_len > 0 and q.is_cuda
+                is_decode and q.is_cuda
                 and os.environ.get("QWEN3_PAGED_ATTN", "triton") == "triton"
             )
             if use_triton:
                 # decode：Triton kernel（bf16 GPU 专用，内部负责 update）
                 attn_output = triton_paged_attention_decode(
                     q, k, v, kv_cache, layer_idx, self.scaling)
-            elif S > 1:
-                # prefill：K/V 本来就是连续张量，直接标准 attention（vLLM 同款做法），
-                # 顺带写入分页供 decode 使用；不做"写页→逐页读回"的白折腾
+            elif not is_decode:
+                # prefill：K/V 写入分页缓存；无历史走 flash 融合，
+                # 有历史（前缀缓存部分命中）走 paged prefill（后缀 attend 历史）
+                hist_len = kv_cache.seq_len
                 kv_cache.update(layer_idx, k, v)
                 use_flash = (
                     q.is_cuda
                     and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
                 )
-                if use_flash:
+                if hist_len > 0:
+                    hk = hist_kv[0][0][layer_idx].unsqueeze(0)
+                    hv = hist_kv[0][1][layer_idx].unsqueeze(0)
+                    attn_output = paged_attention_prefill_from_history(
+                        q, k, v, hk, hv, self.scaling)
+                elif use_flash:
                     attn_output = flash_attention_prefill_batched(
                         q, k, v, [S], self.scaling,
                         self.num_heads, self.num_kv_heads, self.head_dim)
@@ -141,14 +158,18 @@ class Qwen3Attention(nn.Module):
             # batch wrapper 只多做两件事：① 拼 2D 块表（右 pad 0）② 收集 seq_len 数组。
             # 效果：B 个请求合并成一次 kernel 启动，且 grid = B×Hkv 个 program，
             #       解决单请求（B=1）时只有 8 个 program、SM 利用率 <8% 的问题。
+            is_decode = (
+                mode == "decode" if mode is not None else
+                (S == 1 and caches[0].seq_len > 0)
+            )
             use_triton = (
-                S == 1 and caches[0].seq_len > 0 and q.is_cuda
+                is_decode and q.is_cuda
                 and os.environ.get("QWEN3_PAGED_ATTN", "triton") == "triton"
             )
             if use_triton:
                 attn_output = triton_paged_attention_decode_batch(
                     q, k, v, caches, layer_idx, self.scaling, row_ids)
-            elif S > 1 or caches[0].seq_len == 0:
+            elif not is_decode:
                 # ---- prefill 批：B-loop 写页 + 批 matmul 标准 attention ----
                 # 条件 S>1 或 seq_len==0：1-token prompt 的 prefill 也是 S=1，
                 #   不能误走 decode 兜底（逐请求 paged_attention），
@@ -159,14 +180,30 @@ class Qwen3Attention(nn.Module):
                 #    matmul 一次算 B 个请求（大矩阵吃满 cuBLAS）——性能关键在这
                 for i, c in enumerate(caches):
                     c.update(layer_idx, k[i:i + 1], v[i:i + 1])
+                lens = input_lens if input_lens is not None else [S] * B
                 use_flash = (
                     q.is_cuda
                     and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
                 )
-                if use_flash:
+                has_history = any(c.seq_len > 0 for c in caches)
+                if has_history:
+                    # 前缀缓存部分命中：q=后缀，KV=历史(层外预取)+后缀
+                    outs = []
+                    for i, c in enumerate(caches):
+                        li = lens[i]
+                        if c.seq_len > 0:
+                            hk = hist_kv[i][0][layer_idx].unsqueeze(0)
+                            hv = hist_kv[i][1][layer_idx].unsqueeze(0)
+                        else:
+                            hk = k[i:i + 1, :, :0]
+                            hv = v[i:i + 1, :, :0]
+                        outs.append(paged_attention_prefill_from_history(
+                            q[i:i + 1, :, :li], k[i:i + 1, :, :li],
+                            v[i:i + 1, :, :li], hk, hv, self.scaling))
+                    attn_output = torch.cat(outs, dim=0)
+                elif use_flash:
                     # vLLM 风格 varlen flash attention：内核内 GQA + 变长，
                     # 不需要 repeat_kv / 4D mask，lens 给出各请求有效长度
-                    lens = input_lens if input_lens is not None else [S] * B
                     attn_output = flash_attention_prefill_batched(
                         q, k, v, lens, self.scaling,
                         self.num_heads, self.num_kv_heads, self.head_dim)

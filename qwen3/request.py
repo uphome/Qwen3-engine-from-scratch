@@ -97,6 +97,9 @@ class Request:
         # 前缀缓存完全命中：首个 decode 输入 = prompt 最后一个 token
         # （命中跳过 prefill，没有 output_ids，靠它启动自回归）
         self.prefill_last_token: int | None = None
+        # 前缀缓存部分命中：prefill 只送 input_ids[:, prefill_offset:]
+        # （offset = 命中块数 × block_size，块对齐）
+        self.prefill_offset: int = 0
 
     # ============================================================
     # 状态查询（只读，不修改任何字段）

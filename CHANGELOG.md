@@ -7,7 +7,7 @@
 
 ## 2026-11-24 — 工程化：测试地基 + /metrics + SSE 流式
 
-### 新增：前缀缓存（Prefix Cache，阶段 1：完全命中）
+### 新增：前缀缓存（Prefix Cache，阶段 1+2：完全 / 部分命中）
 
 - 块哈希链（`qwen3/prefix_cache.py`）：`h_i = blake2b(h_{i-1}, tokens[块])`
 - 块池状态机：引用计数 + 缓存块（ref=0 保留 K/V）+ LRU 淘汰
@@ -16,7 +16,23 @@
 - 实测（0.6B / 256-token prompt）：TTFT **54.8ms → 6.7ms（8.24x）**，输出一致
 - 指标：`engine_prefix_cache_*`（命中数 / 复用块 / 缓存占用）
 - 文档：[PREFIX_CACHE.md](PREFIX_CACHE.md)；测试：`tests/unit/test_prefix_cache.py`（8）
-- 阶段 2（部分命中：后缀 prefill + attention 读历史 KV）待做
+#### 阶段 2：部分命中（多轮对话）
+
+- 最长前缀匹配（`match_prefix_partial`）：复用前 N 个完整块
+- `Request.prefill_offset` + `Batch` 只送未命中后缀（position_ids 带偏移）
+- attention 历史路径：`paged_attention_prefill_from_history`（q=后缀，KV=历史+后缀，
+  因果 mask 按全局位置）；`get_kv_all` 层前一次性 gather 历史（消除逐层小算子）
+- 短历史回退：`QWEN3_PREFIX_PARTIAL_MIN`（默认 1024）以下走全量 prefill
+  （实测交叉点 ~1k tokens，避免负收益）
+- flash varlen kernel 支持 q/kv 长度分离（`cu_seqlens_k` + causal offset），
+  历史路径 Triton 实现已就绪并通过数值测试（阶段 3 切换）
+- 容量记账：命中块从新块需求扣除；完全命中 COW 私有块计新块；
+  `Scheduler.add` 接收 `reserved_blocks` 防批内超卖
+
+实测（0.6B，2048 前缀 + 16 后缀）：TTFT 59.8 → 40.1ms（1.49x）；
+sweep 交叉点：hist 1024 = 1.04x，hist 2048 = 1.57x。
+已知：bf16 下部分命中与全量 prefill 可能有个别贪心 token 翻转（数值差异）；
+CPU fp32 精确测试 max diff < 1e-4。
 
 ### 代码审查修复（前缀缓存 / SSE 交互）
 

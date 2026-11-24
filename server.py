@@ -159,6 +159,7 @@ class Job:
         self.error: str | None = None
         self.submit_time = time.perf_counter()   # TTFT 起点
         self.ttft: float | None = None           # 首 token 延迟（秒）
+        self.blocks_reserved = 0                 # Engine 记账（新块需求，命中时扣除）
         self.is_stream = False                   # 流式请求：逐 token 推送到 token_queue
         self.token_queue: queue.Queue = queue.Queue()
         self.cancelled = threading.Event()       # 客户端断开 / 取消
@@ -263,8 +264,7 @@ class Engine:
                     req.kv_cache.free()
                     req.kv_cache = None
                 self._jobs.pop(req.request_id, None)
-                self._pending_blocks -= self._needed_blocks(
-                    req.input_len, req.max_new_tokens)
+                self._pending_blocks -= job.blocks_reserved
                 if job.is_stream:
                     job.token_queue.put(None)
                 job.done.set()
@@ -278,23 +278,14 @@ class Engine:
             self.metrics.requests_total += 1
         input_len = job.input_ids.shape[1]
         needed = self._needed_blocks(input_len, job.max_new_tokens)
-        available = self.pool.free_count - self._pending_blocks
-        if needed > available:
-            if track:
-                self.metrics.failed_total += 1
-            job.error = (
-                f"池容量不足: 剩余 {self.pool.free_count} 块, 已入队占用 "
-                f"{self._pending_blocks} 块, 请求需要 {needed} 块"
-                f"（当前单请求约可用 {available * self.pool.block_size} tokens）")
-            job.done.set()
-            job.token_queue.put(None)   # 流式 handler 阻塞在 queue 上，需唤醒
-            return
+        # 容量预检交给 Scheduler.add（前缀命中时不需要全量新块，
+        # 在调度层按"命中块数 + 已入队记账"精确判断）
         try:
             req = Request(
                 request_id=job.request_id, input_ids=job.input_ids,
                 max_new_tokens=job.max_new_tokens, eos_token_id=job.eos_token_id,
             )
-            hit_blocks = self.scheduler.add(req)   # 分配行槽位 + 前缀缓存匹配
+            hit_blocks = self.scheduler.add(req, self._pending_blocks)
             if hit_blocks:
                 self.metrics.prefix_cache_hits_total += 1
                 self.metrics.prefix_cache_hit_blocks_total += hit_blocks
@@ -307,7 +298,9 @@ class Engine:
             return
         job.req = req
         self._jobs[job.request_id] = job
-        self._pending_blocks += needed
+        # 记账 = 总需求 - 前缀复用块（命中请求只占新块）
+        job.blocks_reserved = max(0, needed - hit_blocks)
+        self._pending_blocks += job.blocks_reserved
         log.log(REQUEST_LEVEL, f"入队 req#{job.request_id}: "
                  f"in={input_len}, max={job.max_new_tokens}, T={job.temperature}")
 
@@ -341,7 +334,8 @@ class Engine:
                 # ---- prefill / 无图 eager ----
                 logits = self.model(batch.build_input_ids(),
                                     kv_cache=batch.build_kv_caches(),
-                                    input_lens=batch.input_lens)
+                                    input_lens=batch.input_lens,
+                                    mode=batch.mode)
                 last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
                                         device=logits.device) - 1
 
@@ -386,8 +380,7 @@ class Engine:
                     job.output_ids = list(req.output_ids)
                     job.finish_reason = ("length" if req.num_generated
                                          >= req.max_new_tokens else "stop")
-                    self._pending_blocks -= self._needed_blocks(
-                        req.input_len, req.max_new_tokens)
+                    self._pending_blocks -= job.blocks_reserved
                     if job.request_id >= 0:      # warmup 不计入指标
                         self.metrics.finished_total += 1
                         self.metrics.tokens_total += len(job.output_ids)
@@ -408,8 +401,7 @@ class Engine:
             for req in batch.requests:
                 job = self._jobs.pop(req.request_id, None)
                 if job is not None:
-                    self._pending_blocks -= self._needed_blocks(
-                        req.input_len, req.max_new_tokens)
+                    self._pending_blocks -= job.blocks_reserved
                     if not job.done.is_set():
                         job.error = _describe_error(e, f"req#{req.request_id}")
                         job.done.set()

@@ -194,7 +194,7 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
         else:
             input_ids = batch.build_input_ids()
             logits = model(input_ids, kv_cache=batch.build_kv_caches(),
-                           input_lens=batch.input_lens)
+                           input_lens=batch.input_lens, mode=batch.mode)
             last_idx = torch.tensor(batch.input_lens, dtype=torch.long,
                                     device=logits.device) - 1
         batch_logits = logits[torch.arange(last_idx.shape[0]), last_idx]
