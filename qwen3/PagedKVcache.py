@@ -133,7 +133,6 @@ class PagedKVCache:
         # kernel / update 直接读它，避免每层组装 (B, max_pages) 的 HtoD/D2D
         # 拷贝（profiler 显示批路径每层 zeros + B 次行拷贝 + seq_len HtoD）。
         self.row_id = pool.alloc_row()
-        max_pages = (pool.max_seq_len + pool.block_size - 1) // pool.block_size
         self.block_table_tensor = pool.block_table_2d[self.row_id]  # (max_pages,) 行视图
         self.num_pages = 0       # 当前已分配的页数（与 len(block_table) 同步）
 

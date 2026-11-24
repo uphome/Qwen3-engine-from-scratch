@@ -156,7 +156,7 @@ def main():
     # ============================================================
     # 3. 加载模型
     # ============================================================
-    print(f"\n[1/3] Loading model & weights...")
+    print("\n[1/3] Loading model & weights...")
     config = Qwen3Config.from_pretrained(args.model)
     model = Qwen3ForCausalLM(config)
     load_weights_from_safetensors(model, args.model, device, dtype)
@@ -208,7 +208,7 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize()
         capture_s = time.perf_counter() - t_capture0
-        print(f"  CUDA Graph: 开启（decode 走图，--no-graph 关闭）")
+        print("  CUDA Graph: 开启（decode 走图，--no-graph 关闭）")
         print(f"  CUDA Graph capture/instantiation time: {capture_s:.2f}s")
 
     # ============================================================
@@ -328,14 +328,14 @@ def main():
     print("Benchmark Results")
     print("=" * 72)
 
-    print(f"\n--- Summary ---")
+    print("\n--- Summary ---")
     print(f"  Total GPU time:      {total_gpu_time_s:>8.2f} s")
     print(f"  Total input tokens:  {total_input_tokens:>8}")
     print(f"  Total output tokens: {total_output_tokens:>8}")
     print(f"  Throughput:          {throughput:>8.2f} tok/s")
 
     if device.type == "cuda":
-        print(f"\n--- VRAM ---")
+        print("\n--- VRAM ---")
         print(f"  Before model:        {vram_baseline:>8.2f} GB")
         print(f"  After model:         {vram_model:>8.2f} GB")
         print(f"  Peak (inference):    {peak_vram:>8.2f} GB  (+{vram_overhead:.2f} GB)")
@@ -375,7 +375,7 @@ def main():
     total_decode_ms = sum(r["total_gpu_ms"] - r["prefill_ms"] for r in results)
     total_ms_all = total_prefill_ms + total_decode_ms
     if total_ms_all > 0:
-        print(f"\n--- Time Breakdown ---")
+        print("\n--- Time Breakdown ---")
         print(f"  Prefill: {total_prefill_ms / 1000:.2f}s ({total_prefill_ms / total_ms_all * 100:.1f}%)")
         print(f"  Decode:  {total_decode_ms / 1000:.2f}s ({total_decode_ms / total_ms_all * 100:.1f}%)")
 
@@ -414,7 +414,7 @@ def main():
             )
 
         # --- 算子耗时排名 ---
-        print(f"\n  Top 25 operators by CUDA time:")
+        print("\n  Top 25 operators by CUDA time:")
         print(f"  {'Name':<60} {'CUDA (ms)':>10}  {'%':>6}  {'Calls':>8}")
         print(f"  {'-' * 60} {'-' * 10}  {'-' * 6}  {'-' * 8}")
 
@@ -434,13 +434,13 @@ def main():
             print(f"  {name:<60} {getattr(e, time_attr) / 1000:>10.3f}  {pct:>5.1f}%  {e.count:>8}")
 
         # --- 按算子类型分组（table 输出） ---
-        print(f"\n  Operator type breakdown:")
+        print("\n  Operator type breakdown:")
         print(prof.key_averages().table(row_limit=20))
 
         # 导出 Chrome trace
         prof.export_chrome_trace(args.profile_output)
         print(f"\n  Chrome trace saved to: {args.profile_output}")
-        print(f"  在 Chrome 中打开 chrome://tracing，加载此文件即可查看火焰图")
+        print("  在 Chrome 中打开 chrome://tracing，加载此文件即可查看火焰图")
 
     print(f"\n{'=' * 72}")
     print("Done.")

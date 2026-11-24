@@ -135,9 +135,6 @@ if _HAS_TRITON:
         vals = tl.load(
             topk_vals_ptr + row * stride_vals_row + offs,
             mask=mask, other=float("-inf")).to(tl.float32)
-        idx = tl.load(
-            topk_idx_ptr + row * stride_idx_row + offs,
-            mask=mask, other=0)
 
         # params 布局 (4, B)：一次 HtoD 拷入全部逐请求采样参数。
         temp = tl.load(params_ptr + row).to(tl.float32)
@@ -174,6 +171,8 @@ if _HAS_TRITON:
 
         sampled = tl.load(topk_idx_ptr + row * stride_idx_row + best)
         greedy_idx = tl.load(topk_idx_ptr + row * stride_idx_row)
+        #对每个序列（每行），如果开了 greedy 模式，就输出 top-1 token；否则输出采样得到的 token。
+        #这样同一个 kernel 就能同时支持贪心解码和随机采样，不用分成两个 kernel。
         out = tl.where(greedy != 0, greedy_idx, sampled)
         tl.store(out_ptr + row, out)
 

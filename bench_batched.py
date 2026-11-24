@@ -17,7 +17,6 @@
 
 import argparse
 import os
-import statistics
 import time
 from random import randint, seed
 
@@ -398,7 +397,7 @@ def main():
     print(format_table(headers, rows))
 
     # 加速比
-    print(f"\n--- Speedup vs serial ---")
+    print("\n--- Speedup vs serial ---")
     serial_tok_s = serial["n_tokens"] / serial["total_s"]
     serial_dpt = serial["decode_ms"] / serial["n_tokens"]
     for r in results[1:]:

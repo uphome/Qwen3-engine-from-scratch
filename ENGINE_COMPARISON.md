@@ -40,7 +40,6 @@
 - [ ] prefill 写入用 Triton（变长 + 跨页，PagedKVCache.update 仍是 PyTorch）
 
 ### 工程层（P3）
-- [ ] GPU 内采样（multinomial 进 kernel，消除 CPU 往返）
 - [ ] 换出 (swap)：GPU↔CPU KV 块超卖显存
 
 ---

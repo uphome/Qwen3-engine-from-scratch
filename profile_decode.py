@@ -148,7 +148,7 @@ def main():
             model(input_ids, kv_cache=caches, input_lens=b.input_lens)
             if device.type == "cuda":
                 torch.cuda.synchronize()
-        total = report(prof, args, device, "decode")
+        report(prof, args, device, "decode")
     else:
         # prefill 模式：fresh scheduler，第一次调度必为 prefill 批。
         # 预热已触发 JIT，这里 profile 的是干净的 prefill forward（右 pad 批）。
@@ -166,11 +166,11 @@ def main():
             model(input_ids, kv_cache=caches, input_lens=b.input_lens)
             if device.type == "cuda":
                 torch.cuda.synchronize()
-        total = report(prof, args, device, "prefill")
+        report(prof, args, device, "prefill")
 
-    print(f"\n提示: 墙钟 ≈ kernel 时间 + GPU 空等 CPU 的时间。"
-          f"若墙钟 >> 本脚本的 kernel 总时间，瓶颈在 CPU 提交（kernel 启动间隙），"
-          f"考虑 CUDA Graph；若接近，瓶颈在 GPU 计算。")
+    print("\n提示: 墙钟 ≈ kernel 时间 + GPU 空等 CPU 的时间。"
+          "若墙钟 >> 本脚本的 kernel 总时间，瓶颈在 CPU 提交（kernel 启动间隙），"
+          "考虑 CUDA Graph；若接近，瓶颈在 GPU 计算。")
 
 
 if __name__ == "__main__":

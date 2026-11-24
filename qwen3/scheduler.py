@@ -24,7 +24,7 @@ from collections import deque
 import torch
 
 from .batch import Batch
-from .request import Request, WAITING, PREFILLING, DECODING
+from .request import Request, WAITING
 from .PagedKVcache import KVCachePool, PagedKVCache
 
 

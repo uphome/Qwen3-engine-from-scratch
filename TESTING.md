@@ -1,0 +1,62 @@
+# 测试说明（TESTING）
+
+## 分层与标记
+
+| 层 | 目录 | 标记 | 环境 |
+|---|---|---|---|
+| 单元 / 逻辑 | `tests/unit/` | 无 | CPU，秒级，CI 必跑 |
+| Kernel 数值 | `tests/kernels/` | `gpu` | NVIDIA GPU + Triton |
+| 执行路径一致性 | `tests/model/` | `gpu` + `slow` | GPU（CUDA Graph 捕获） |
+| 端到端 / 压测 | 待建（W2+） | `gpu` / `slow` | GPU |
+
+无 GPU 的环境会自动跳过 `gpu` 用例（conftest 钩子），CPU 子集可直接进 CI。
+
+## 运行
+
+```bash
+# 全量（推荐，GPU 机器）
+pytest -q
+
+# 仅 CPU（CI 同款）
+pytest -m "not gpu" -q
+
+# 仅 GPU kernel 回归
+pytest -m "gpu and not slow" -q
+
+# 只跑某个文件
+pytest tests/unit/test_scheduler.py -v
+```
+
+**重要环境变量**（驱动只支持 CUDA <= 11.6，如 510.54 时必须设置，否则 Triton
+cubin 加载失败、GPU 用例报 "cpu tensor" 类假错误）：
+
+```bash
+export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
+```
+
+## 现有用例矩阵（W1）
+
+| 文件 | 覆盖点 | 用例数 |
+|---|---|---|
+| `tests/unit/test_config.py` | config.json 读取、head_dim 推导、默认值 | 4 |
+| `tests/unit/test_rope.py` | 预计算表数值、查表、rotate_half、位置 0 恒等、范数保持、相对位置性质 | 7 |
+| `tests/unit/test_kv_pool.py` | 块分配/回收、复用清零、行槽位、跨页预留、seq_lens 同步、prefill 写入读回、池闭环、超长报错 | 9 |
+| `tests/unit/test_request.py` | 状态机合法/非法迁移、结束判定、输出拼接、finish 归还块 | 9 |
+| `tests/unit/test_batch.py` | prefill 右 pad、decode 组装、input_lens、kv_caches | 4 |
+| `tests/unit/test_scheduler.py` | 组批、prefill 补位不超编、FIFO、完成回收、池闭环 | 7 |
+| `tests/unit/test_chat_template.py` | Qwen3 特殊 token、thinking 开关、多轮 | 4 |
+| `tests/kernels/test_update_kv_stride.py` | **v3.2 fused-qkv stride bug 回归**：连续/非连续切片、跨页写入 | 3 |
+| `tests/model/test_graph_equivalence.py` | CUDA Graph 图池 vs eager 逐 step logits 一致（bucket 1/2、空槽、池闭环） | 2 |
+
+## 约定
+
+- **新功能必须带测试**：至少 1 个正向用例 + 1 个边界/回归用例。
+- **GPU 用例写 `gpu` marker**：CI 无 GPU，靠它跳过；不要靠 `if cuda` 分支静默跳过。
+- **真实数值对比优先**：kernel 改动对比 PyTorch 参考实现；执行路径改动对比 eager。
+- **测试不依赖网络**：不下载模型；需要权重时用微型随机模型（`tiny_model` fixture）。
+
+## 后续（按路线图）
+
+- W2：prefix caching 命中率 / 共享块生命周期 / 跨对话复用收益
+- W3：SSE 流式（流式拼接 == 非流式）、server API e2e、/metrics
+- W4：长稳压测 + 完整 e2e 矩阵 + 报告归档
