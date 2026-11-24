@@ -45,8 +45,11 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 | `tests/unit/test_batch.py` | prefill 右 pad、decode 组装、input_lens、kv_caches | 4 |
 | `tests/unit/test_scheduler.py` | 组批、prefill 补位不超编、FIFO、完成回收、池闭环 | 7 |
 | `tests/unit/test_chat_template.py` | Qwen3 特殊 token、thinking 开关、多轮 | 4 |
+| `tests/unit/test_metrics.py` | Engine 计数/TTFT、容量拒绝计数、Prometheus 格式可解析 | 4 |
+| `tests/unit/test_stream_engine.py` | 流式 token 推送顺序、取消清理/归还、流式==非流式 | 3 |
 | `tests/kernels/test_update_kv_stride.py` | **v3.2 fused-qkv stride bug 回归**：连续/非连续切片、跨页写入 | 3 |
 | `tests/model/test_graph_equivalence.py` | CUDA Graph 图池 vs eager 逐 step logits 一致（bucket 1/2、空槽、池闭环） | 2 |
+| `tests/e2e/test_server_stream.py` | 真实 server SSE：流式==非流式、chunk 格式/usage、断开取消 | 3 |
 
 ## 约定
 
@@ -57,6 +60,6 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 
 ## 后续（按路线图）
 
-- W2：prefix caching 命中率 / 共享块生命周期 / 跨对话复用收益
-- W3：SSE 流式（流式拼接 == 非流式）、server API e2e、/metrics
-- W4：长稳压测 + 完整 e2e 矩阵 + 报告归档
+- prefix caching（哈希 KV）：命中率 / 共享块生命周期 / 跨对话复用收益
+- 压测：引擎 / HTTP 并发扫描、TTFT/TPOT、长稳压测
+- 更多 e2e：tool calling、错误码边界（400/503）、`/v1/completions` 流式

@@ -24,6 +24,8 @@
 - [x] decode 的 cos/sin RoPE 计算移入图（v3.1，预计算表 + 图内查表）
 - [x] QKV/MLP 投影融合（v3.2，qkv_proj / gate_up_proj，3→1/2→1 GEMM）
 - [x] GPU 内采样（v3.3，batch topk + Triton Gumbel-max，batch=28 采样提速 75x）
+- [x] SSE 流式（stream=true，逐 token 推送 + 客户端断开取消）
+- [x] `/metrics` 可观测（Prometheus 文本格式，含 TTFT summary）
 
 ### 工程流水线（P0，收益最大）
 
@@ -104,7 +106,9 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）
 |---|---|---|---|
 | KV 块清零 | ✅ alloc 复用页清零（v2.2） | ✅ zero-initialized KV cache | 已对齐（数据泄漏防护） |
 | 精度控制 | bf16 存储 + fp32 累积 | 同款 + fp8 支持 | 相同哲学 ✓ |
-| 采样 | Python 逐 token | CUDA kernel 内采样（multinomial） | CPU-GPU 往返 |
+| 采样 | ✅ GPU 内采样（v3.3 batch topk + Triton Gumbel-max） | ✅ CUDA kernel 内采样 | 已对齐 |
+| 流式输出 | ✅ SSE（stream=true，逐 token + 断开取消） | ✅ SSE | 已对齐 |
+| 可观测性 | ✅ `/metrics`（Prometheus，含 TTFT summary） | ✅ Prometheus + Grafana | 基础对齐 |
 | 后端 | 单 NVIDIA CUDA | 多后端（ROCm/CPU/FPGA） | 可移植性 |
 | 模型支持 | Qwen3 专用 | 全模型族（AutoModel 架构） | 通用性 |
 
@@ -227,6 +231,8 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P0 | decode 的 cos/sin 移入图 | 省每步 rotary_emb / copy_ | 低 | [x] |
 | P0 | QKV/MLP 投影融合（3→1 kernel） | decode 每 token +4.6%~6.0% | 中 | [x] |
 | P1 | prefill K/V 写入 Triton（变长+跨页） | 消除 PyTorch scatter | 中 | [ ] |
+| P1 | SSE 流式输出 + 断开取消 | OpenAI 兼容 + TTFT 可测 | 中 | [x] |
+| P1 | `/metrics` 可观测性 | Prometheus 指标（含 TTFT） | 低 | [x] |
 | P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |
 | P2 | split-K decode kernel | 长上下文 decode 提速 | 中 | [ ] |
 | P2 | chunked prefill 混批 | 长 prompt 不卡批 | 高 | [ ] |

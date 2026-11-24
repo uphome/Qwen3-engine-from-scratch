@@ -159,6 +159,9 @@ class Job:
         self.error: str | None = None
         self.submit_time = time.perf_counter()   # TTFT 起点
         self.ttft: float | None = None           # 首 token 延迟（秒）
+        self.is_stream = False                   # 流式请求：逐 token 推送到 token_queue
+        self.token_queue: queue.Queue = queue.Queue()
+        self.cancelled = threading.Event()       # 客户端断开 / 取消
         self.done = threading.Event()
 
 
@@ -222,6 +225,8 @@ class Engine:
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
         while True:
+            # 每轮先清理客户端已断开的请求（不白算）
+            self._cleanup_cancelled()
             # 无活可干 → 阻塞等新作业（避免忙轮询烧 CPU/GPU）
             if not self.scheduler.has_pending():
                 job = self.q.get()
@@ -242,6 +247,26 @@ class Engine:
     def _needed_blocks(self, input_len: int, max_new_tokens: int) -> int:
         bs = self.pool.block_size
         return (input_len + max_new_tokens + bs - 1) // bs
+
+    def _cleanup_cancelled(self):
+        """移除客户端已断开的请求：归还 KV 块 + 记账 + 通知流式端退出"""
+        for container in (self.scheduler.waiting, self.scheduler.running):
+            for req in list(container):
+                job = self._jobs.get(req.request_id)
+                if job is None or not job.cancelled.is_set():
+                    continue
+                container.remove(req)
+                if req.kv_cache is not None:
+                    req.kv_cache.free()
+                    req.kv_cache = None
+                self._jobs.pop(req.request_id, None)
+                self._pending_blocks -= self._needed_blocks(
+                    req.input_len, req.max_new_tokens)
+                if job.is_stream:
+                    job.token_queue.put(None)
+                job.done.set()
+                log.log(REQUEST_LEVEL, f"取消 req#{req.request_id}"
+                        f"（客户端断开），已归还 KV 块")
 
     def _dispatch(self, job: Job):
         """入队前容量校验（含已入队未归还的记账，防批内超卖）+ 组装 Request"""
@@ -330,6 +355,13 @@ class Engine:
                     job.ttft = now - job.submit_time
                     self.metrics.ttfts.append(job.ttft)
 
+            # 流式推送本步新 token（on_step_done 之前/之后均可；先推送
+            # 保证 HTTP 线程尽早拿到首包）
+            for i, req in enumerate(batch.requests):
+                job = self._jobs.get(req.request_id)
+                if job is not None and job.is_stream:
+                    job.token_queue.put(int(next_tokens[i].item()))
+
             self.scheduler.on_step_done(batch, next_tokens)
 
             # 完成者：收集输出 + 归还记账 + 通知 HTTP 线程
@@ -350,6 +382,8 @@ class Engine:
                     if job.request_id >= 0:      # warmup 不计入指标
                         self.metrics.finished_total += 1
                         self.metrics.tokens_total += len(job.output_ids)
+                    if job.is_stream:
+                        job.token_queue.put(None)     # 流结束哨兵
                     log.log(REQUEST_LEVEL, f"完成 req#{req.request_id}: "
                              f"gen={req.num_generated}, reason={job.finish_reason}, "
                              f"pool_free={self.pool.free_count}")
@@ -370,6 +404,8 @@ class Engine:
                     if not job.done.is_set():
                         job.error = _describe_error(e, f"req#{req.request_id}")
                         job.done.set()
+                    if job.is_stream:
+                        job.token_queue.put(None)
                 if req.kv_cache is not None:      # 归还资源（跳过状态机）
                     req.kv_cache.free()
                     req.kv_cache = None
@@ -589,12 +625,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     # ---- 核心处理 ----
 
-    def _run_generation(self, prompt_text: str, body: dict) -> dict:
-        """公共生成路径：prompt 文本 → tokenize → 入队 → 等结果 → 返回 token 级数据"""
+    def _prepare_job(self, prompt_text: str, body: dict) -> tuple[Job, int]:
+        """tokenize + 参数校验 + 容量预检 + 创建 Job（不提交）"""
         srv = self.server
-        if body.get("stream"):
-            raise OpenAIError(400, "stream 流式输出暂不支持（v2）")
-
         input_ids = torch.tensor([srv.tokenizer.encode(prompt_text)],
                                  device=srv.device)
         input_len = input_ids.shape[1]
@@ -620,6 +653,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                   max_new_tokens=max_tokens, temperature=temperature,
                   top_k=top_k, top_p=top_p)
         srv.engine._next_id += 1
+        return job, input_len
+
+    def _run_generation(self, prompt_text: str, body: dict) -> dict:
+        """非流式公共生成路径：tokenize → 入队 → 等结果 → 返回 token 级数据"""
+        srv = self.server
+        job, input_len = self._prepare_job(prompt_text, body)
+
         t0 = time.perf_counter()
         srv.engine.submit(job)
         if not job.done.wait(WAIT_TIMEOUT):
@@ -634,6 +674,122 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         return {"request_id": job.request_id, "input_len": input_len,
                 "output_ids": job.output_ids,
                 "finish_reason": job.finish_reason}
+
+    # ---- SSE 流式 ----
+
+    def _sse_start(self):
+        """开始 SSE 响应。无 Content-Length → 用 close-delimited 响应
+        （写完 [DONE] 后关闭连接），HTTP/1.1 合法且客户端（curl/SDK）兼容。"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")   # nginx 等反代不缓冲
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.close_connection = True
+
+    def _sse_send(self, payload):
+        """发送一条 SSE 事件（dict → JSON；str 原样，如 [DONE]）"""
+        text = (payload if isinstance(payload, str)
+                else json.dumps(payload, ensure_ascii=False))
+        self.wfile.write(f"data: {text}\n\n".encode("utf-8"))
+        self.wfile.flush()      # 关键：不等缓冲区满，立刻推给客户端
+
+    def _stream_generation(self, prompt_text: str, body: dict, chat: bool):
+        """流式生成：Engine 每产出一个 token 就推一个 SSE 事件
+
+        首 token 先等（提交失败/容量拒绝时还没发 SSE 头，可正常回 HTTP 错误），
+        之后边收边发；客户端断开 → cancel，Engine 下一轮清理并归还 KV。
+        """
+        srv = self.server
+        job, input_len = self._prepare_job(prompt_text, body)
+        job.is_stream = True
+        t0 = time.perf_counter()
+        srv.engine.submit(job)
+
+        try:
+            first = job.token_queue.get(timeout=WAIT_TIMEOUT)
+        except queue.Empty:
+            job.cancelled.set()
+            raise OpenAIError(503, "生成超时（请求仍在后台继续，结果丢弃）")
+
+        if first is None:                  # 未开始产出：错误还在 HTTP 头之前
+            if job.error:
+                raise OpenAIError(503, job.error)
+            self._sse_start()
+            self._sse_send("[DONE]")
+            return
+
+        self._sse_start()
+        created = int(time.time())
+        chunk_id = (f"chatcmpl-{job.request_id:03d}" if chat
+                    else f"cmpl-{job.request_id:03d}")
+
+        def emit(delta: dict, finish_reason=None):
+            if chat:
+                obj = {"id": chunk_id, "object": "chat.completion.chunk",
+                       "created": created, "model": srv.model_id,
+                       "choices": [{"index": 0, "delta": delta,
+                                    "finish_reason": finish_reason}]}
+            else:
+                obj = {"id": chunk_id, "object": "text_completion",
+                       "created": created, "model": srv.model_id,
+                       "choices": [{"index": 0, "text": delta.get("content", ""),
+                                    "finish_reason": finish_reason}]}
+            self._sse_send(obj)
+
+        if chat:
+            emit({"role": "assistant", "content": ""})
+
+        ids: list[int] = []
+        sent_text = ""
+        n_tokens = 0
+        finish_reason = "stop"
+        tok = first
+        try:
+            while tok is not None:
+                ids.append(tok)
+                n_tokens += 1
+                # 增量解码：对累计 ids decode 后取新增后缀，
+                # 避免多字节 UTF-8 被 token 边界拆开产生乱码
+                text = srv.tokenizer.decode(ids, skip_special_tokens=True)
+                delta = text[len(sent_text):]
+                sent_text = text
+                if delta:
+                    emit({"content": delta})
+                tok = job.token_queue.get(timeout=WAIT_TIMEOUT)
+
+            if job.error:                    # 推流中途异常：发 error 事件后收尾
+                self._sse_send({"error": {"message": job.error,
+                                          "type": "server_error", "code": 503}})
+            else:
+                finish_reason = job.finish_reason or "stop"
+                emit({}, finish_reason)
+
+            include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+            if include_usage:
+                self._sse_send({
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk" if chat else "text_completion",
+                    "created": created, "model": srv.model_id,
+                    "choices": [],
+                    "usage": {"prompt_tokens": input_len,
+                              "completion_tokens": n_tokens,
+                              "total_tokens": input_len + n_tokens},
+                })
+            self._sse_send("[DONE]")
+
+            elapsed = time.perf_counter() - t0
+            log.log(REQUEST_LEVEL, f"HTTP stream req#{job.request_id}: "
+                     f"in={input_len}, gen={n_tokens}, {elapsed:.1f}s, "
+                     f"reason={finish_reason}")
+        except (BrokenPipeError, ConnectionResetError):
+            job.cancelled.set()
+            log.log(REQUEST_LEVEL, f"客户端断开 req#{job.request_id}，取消生成")
+        except queue.Empty:
+            job.cancelled.set()
+            log.warning(f"流式生成超时 req#{job.request_id}（已取消）")
 
     def _handle_chat(self, body: dict):
         srv = self.server
@@ -659,6 +815,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                                           enable_thinking=enable_thinking)
             except KeyError as e:
                 raise OpenAIError(400, f"messages 格式错误: {e}")
+
+        if body.get("stream"):
+            self._stream_generation(prompt_text, body, chat=True)
+            return
 
         result = self._run_generation(prompt_text, body)
 
@@ -694,6 +854,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise OpenAIError(400, "缺少 prompt（字符串）")
+        if body.get("stream"):
+            self._stream_generation(prompt, body, chat=False)
+            return
         result = self._run_generation(prompt, body)
 
         output_text = srv.tokenizer.decode(result["output_ids"],

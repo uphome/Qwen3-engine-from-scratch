@@ -78,6 +78,47 @@ curl http://127.0.0.1:8000/metrics
 # ...
 ```
 
+### 2.2 流式（SSE）
+
+`POST /v1/chat/completions` 与 `POST /v1/completions` 支持 `"stream": true`：
+返回 `Content-Type: text/event-stream`，逐 token 推送 `data: {...}` 事件，
+以 `data: [DONE]` 结束。
+
+**chat 流式事件示例**：
+
+```
+data: {"id":"chatcmpl-000","object":"chat.completion.chunk","created":...,"model":"qwen3-0.6b",
+       "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-000","object":"chat.completion.chunk",...,"choices":[{"index":0,"delta":{"content":"我是"},"finish_reason":null}]}
+...
+data: {...,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: [DONE]
+```
+
+**用法**：
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"messages":[{"role":"user","content":"你好"}],"max_tokens":64,"stream":true}'
+```
+
+**实现要点**：
+
+- 引擎每产出一个 token → `Engine` 把 token 放进 `Job.token_queue` →
+  HTTP 线程立即 `wfile.write(...) + flush()`（不攒批）
+- 增量解码：累计 token ids 后整体 decode 再取新增后缀，多字节 UTF-8
+  （中文/emoji）不会被 token 边界拆坏
+- 首 token 之前若发生容量拒绝/异常，仍返回正常 HTTP 错误码（4xx/5xx），
+  不会先发 200
+- `stream_options: {"include_usage": true}` 时，finish chunk 之后追加一个
+  `choices: []` 的 usage chunk（OpenAI 同款）
+- **客户端断开**：写事件抛 `BrokenPipeError` → 标记取消 → 引擎在下一调度轮
+  清理该请求并归还 KV 块（不白算）
+- 响应无 `Content-Length`，用 `Connection: close` 结束（HTTP/1.1 合法的
+  close-delimited 响应；curl / OpenAI SDK 均兼容）
+
 ---
 
 ## 3. Chat 补全（主要接口）
