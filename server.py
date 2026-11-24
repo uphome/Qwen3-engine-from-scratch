@@ -175,6 +175,7 @@ class EngineMetrics:
     TTFT_WINDOW = 256      # TTFT 滑动窗口样本数（summary 分位数近似）
 
     def __init__(self):
+        self.lock = threading.Lock()      # 保护 ttfts（跨线程读/写）
         self.start_time = time.perf_counter()
         self.requests_total = 0       # 收到的 API 请求（不含 warmup）
         self.finished_total = 0       # 成功完成
@@ -286,6 +287,7 @@ class Engine:
                 f"{self._pending_blocks} 块, 请求需要 {needed} 块"
                 f"（当前单请求约可用 {available * self.pool.block_size} tokens）")
             job.done.set()
+            job.token_queue.put(None)   # 流式 handler 阻塞在 queue 上，需唤醒
             return
         try:
             req = Request(
@@ -301,6 +303,7 @@ class Engine:
                 self.metrics.failed_total += 1
             job.error = f"入队失败: {e}"
             job.done.set()
+            job.token_queue.put(None)   # 流式 handler 阻塞在 queue 上，需唤醒
             return
         job.req = req
         self._jobs[job.request_id] = job
@@ -358,7 +361,8 @@ class Engine:
                 if (job is not None and job.request_id >= 0
                         and job.ttft is None and req.num_generated == 0):
                     job.ttft = now - job.submit_time
-                    self.metrics.ttfts.append(job.ttft)
+                    with self.metrics.lock:
+                        self.metrics.ttfts.append(job.ttft)
 
             # 流式推送本步新 token（on_step_done 之前/之后均可；先推送
             # 保证 HTTP 线程尽早拿到首包）
@@ -529,8 +533,10 @@ def render_metrics(engine, model_id: str = "") -> str:
 
     # TTFT summary：分位数（滑动窗口）+ count/sum（Prometheus summary 惯例）
     ttft_samples: list[str] = []
-    if m.ttfts:
-        vals = sorted(m.ttfts)
+    with m.lock:                 # 快照，避免与 Engine 线程 append 竞争
+        ttft_vals = list(m.ttfts)
+    if ttft_vals:
+        vals = sorted(ttft_vals)
         n = len(vals)
         for q in (0.5, 0.95, 0.99):
             idx = min(n - 1, int(q * (n - 1)))

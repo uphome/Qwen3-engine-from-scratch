@@ -368,8 +368,12 @@ def main():
                                    temperature=args.temperature,
                                    top_k=args.top_k, top_p=args.top_p,
                                    runner=runner))
-        assert kv_pool.free_count == kv_pool.total_blocks - n_reserved, \
-            f"batch={bs} 池未归还: {kv_pool.free_count}/{kv_pool.total_blocks}"
+        # 前缀缓存：请求结束后的完整块保留在缓存池（cached_count），
+        # 所以闭环判定 = free + cached == total - 图预留
+        assert (kv_pool.free_count + kv_pool.cached_count
+                == kv_pool.total_blocks - n_reserved), \
+            (f"batch={bs} 池未归还: free={kv_pool.free_count} "
+             f"cached={kv_pool.cached_count}/{kv_pool.total_blocks}")
 
     # ---- 报告 ----
     serial = results[0]

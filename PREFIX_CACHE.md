@@ -161,6 +161,7 @@ B: add(相同 prompt)
 | 缓存上限固定 | `num_blocks // 2` | 可配置 / 按命中率自适应 |
 | 无跨进程持久化 | 缓存随进程生命周期 | 可选：磁盘 KV 持久化 |
 | COW 开销 | 每次命中复制 1 个块（~18MB） | 可改为仅重算最后一个 token 不写 KV |
+| 仅 Scheduler/server 路径 | `generate()`（main.py 单请求）不走 Scheduler，不查缓存；请求结束仍会登记块（受 LRU 上限约束） | 可选：generate 接入查询 |
 
 ---
 

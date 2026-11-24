@@ -98,6 +98,10 @@ class KVCachePool:
         PagedKVCache.free() → release_block()（会把完整块登记为缓存）。
         """
         for blk in block_ids:
+            h = self._block_hashes.pop(blk, None)
+            if h is not None and self._prefix_index.get(h) == blk:
+                del self._prefix_index[h]
+            self._cached_lru.pop(blk, None)
             self.block_refs[blk] = 0
         self.free_block_ids.extend(block_ids)
 

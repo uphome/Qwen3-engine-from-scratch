@@ -68,7 +68,12 @@ class Scheduler:
                 # 最后一个 token 的 logits（position = L-1，会写该位置 KV），
                 # 共享块不能被写 → 复制末块为私有块，原块保持只读缓存。
                 last, last_hash = blocks[-1], hashes[-1]
-                priv = self.pool.alloc(1)[0]
+                try:
+                    priv = self.pool.alloc(1)[0]
+                except RuntimeError:
+                    for b, h in zip(blocks, hashes):
+                        self.pool.release_block(b, h)
+                    raise
                 self.pool.copy_block(last, priv)
                 self.pool.release_block(last, last_hash)
                 blocks = blocks[:-1] + [priv]

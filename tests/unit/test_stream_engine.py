@@ -108,3 +108,19 @@ def test_stream_and_non_stream_produce_same_tokens(tiny_model, kv_pool_factory):
         assert tokens == job1.output_ids
     finally:
         engine.stop()
+
+
+def test_stream_job_rejected_wakes_handler(tiny_model, kv_pool_factory):
+    """容量拒绝时必须往 token_queue 推哨兵，否则流式 handler 挂到超时"""
+    pool = kv_pool_factory(num_blocks=1, max_seq_len=16)   # 只够 1 页
+    engine = Engine(tiny_model, pool, runner=None, batch_size=1)
+    engine.start()
+    try:
+        job = make_stream_job(engine, max_new_tokens=64)   # 需要多页
+        engine.submit(job)
+        tok = job.token_queue.get(timeout=30)
+        assert tok is None
+        assert job.error is not None and "池容量不足" in job.error
+        assert engine.metrics.failed_total == 1
+    finally:
+        engine.stop()

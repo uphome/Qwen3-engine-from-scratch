@@ -18,6 +18,16 @@
 - 文档：[PREFIX_CACHE.md](PREFIX_CACHE.md)；测试：`tests/unit/test_prefix_cache.py`（8）
 - 阶段 2（部分命中：后缀 prefill + attention 读历史 KV）待做
 
+### 代码审查修复（前缀缓存 / SSE 交互）
+
+- `bench_batched.py` / `test/test_batched.py`：池闭环断言计入前缀缓存块
+  （`free + cached == total - 图预留`）——修复缓存块导致的"池未归还"误报
+- 流式请求被容量拒绝时补推 `token_queue` 哨兵：否则 HTTP handler 会挂到
+  600s 超时
+- TTFT summary 加锁：避免 `/metrics` 线程排序时与 Engine 线程 append 竞争
+- `KVCachePool.free()` 防御性清理缓存索引（防外部误 free 缓存块后悬空）
+- 前缀缓存 COW 分配失败时归还已匹配块（防御性回滚）
+
 ### 新增：pytest 测试体系（61 用例）
 
 - `tests/unit/`（46）：config / rope / kv_pool / request / batch / scheduler /

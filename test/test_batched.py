@@ -100,7 +100,7 @@ def check_batch(model, config, n_reqs, batch_size, seed):
             f"[seed={seed} bs={batch_size}] Request {req.request_id}: " \
             f"调度器 {req.output_ids} != oracle {oracle}"
 
-    assert kv_pool.free_count == kv_pool.total_blocks, \
+    assert kv_pool.free_count + kv_pool.cached_count == kv_pool.total_blocks, \
         f"[seed={seed} bs={batch_size}] 池未归还: " \
         f"free={kv_pool.free_count}/{kv_pool.total_blocks}"
     assert len(scheduler.finished) == n_reqs
