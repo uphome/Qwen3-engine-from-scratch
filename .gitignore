@@ -1,20 +1,35 @@
+# Python
 *.pyc
 __pycache__/
 *.egg-info/
 dist/
 build/
-test/
-.DS_Store
+.pytest_cache/
+.ruff_cache/
+
+# 模型权重（不入库）
 *.safetensors
 *.pt
 *.pth
+models/
+
+# 个人学习脚本（Fusedattention 等，不入库；正式测试见 tests/）
+test/
+
+# Profiler / trace 产物
+trace.json
+*.qdrep
+*.nsys-rep
+traces/
+logs/
+results/raw/
+
+# 编辑器 / 系统
+.DS_Store
 .idea/
 .vscode/
 *.swp
 *.swo
-trace.json
-*.qdrep
-*.nsys-rep
-logs/
 
+# 本地工具
 .codegraph/

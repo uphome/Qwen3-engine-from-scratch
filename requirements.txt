@@ -1,0 +1,14 @@
+# 核心运行时依赖（Python >= 3.10）
+# 注意：torch 走 cu118 wheel 源（与 CUDA 11.x 驱动匹配）
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.2.2+cu118
+triton==2.2.0
+
+# 权重加载 / 分词
+safetensors>=0.4.0
+tokenizers>=0.20.0
+
+# 仅用于 AutoTokenizer / 模型配置（推理前向全部手写，不依赖 transformers 模型类）
+transformers>=4.51.0
+huggingface_hub>=0.30.0

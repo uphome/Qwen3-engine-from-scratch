@@ -4,17 +4,24 @@
 
 ## 快速开始
 
+环境要求：Python >= 3.10、NVIDIA GPU（CUDA 11.x/12.x，支持 bf16）。
+
 ```bash
-git clone https://github.com/uphomer/Qwen3-engine-from-scratch.git
+git clone https://github.com/uphome/Qwen3-engine-from-scratch.git
 cd Qwen3-engine-from-scratch
 
-# 依赖: torch, safetensors, tokenizers
-pip install torch safetensors tokenizers
+# 1. 安装依赖（torch 走 cu118 wheel 源）
+pip install -r requirements.txt
 
-# 下载 Qwen3-0.6B 并运行（交互式：输入 prompt 生成，/quit 退出）
-python main.py --model /path/to/Qwen3-0.6B --temperature 0
-# 注：decode 默认走 CUDA Graph（v3.0）；--no-graph 或 QWEN3_CUDA_GRAPH=0 关闭
+# 2. 下载 Qwen3-0.6B 权重（约 1.2GB，默认到 models/Qwen3-0.6B）
+bash scripts/download_model.sh
+
+# 3. 运行（交互式：输入 prompt 生成，/quit 退出）
+python main.py --model models/Qwen3-0.6B --temperature 0
 ```
+
+> decode 默认走 CUDA Graph（v3.0）；`--no-graph` 或 `QWEN3_CUDA_GRAPH=0` 关闭。
+> 若 `nvidia-smi` 显示驱动 CUDA <= 11.6（如 510.54），需先设置 Triton ptxas（见下方 Benchmark 说明）。
 
 ## HTTP API 服务（OpenAI 兼容，零新依赖）
 
@@ -57,22 +64,27 @@ curl -X POST http://127.0.0.1:8000/v1/completions \
 ├── main.py               # CLI 入口
 ├── generate.py           # 自回归生成 + 采样（temperature/top-k/top-p）
 ├── chat_template.py      # Qwen3 Chat Format（<|im_start|>...）
+├── server.py             # OpenAI 兼容 HTTP API（连续批处理后台引擎）
 ├── bench.py              # 吞吐基准测试 + torch.profiler trace 导出
 ├── bench_batched.py      # 连续批处理基准（Scheduler 调度，decode 走 CUDA Graph）
+├── bench_sampling.py     # GPU 采样微基准
+├── bench_server_sampling.py  # HTTP 服务端采样压测
 ├── profile_decode.py     # prefill/decode 步 kernel 时间剖析
+├── scripts/              # 工具脚本（模型下载等）
+├── tests/                # 正式测试（pytest，CPU/GPU 分层）
 └── qwen3/                # 核心模型
     ├── config.py         # Qwen3Config — 纯数据类
     ├── norm.py           # RMSNorm
-    ├── rope.py           # RotaryEmbedding
-    ├── kv_cache.py       # NaiveKVCache
+    ├── rope.py           # RotaryEmbedding（v3.1 预计算表）
     ├── PagedKVcache.py   # 分页 KV（共享池 + GPU 常驻 2D 块表 + row_id 行槽位）
-    ├── attention.py      # Qwen3Attention（GQA + QK-Norm，三段式：flash/varlen/decode）
-    ├── mlp.py            # Qwen3MLP（SwiGLU）
+    ├── attention.py      # Qwen3Attention（GQA + QK-Norm + fused QKV）
+    ├── mlp.py            # Qwen3MLP（SwiGLU + fused gate/up）
     ├── decoder.py        # Qwen3DecoderLayer（Pre-Norm）
     ├── model.py          # Qwen3Model + Qwen3ForCausalLM（含 forward_decode）
     ├── scheduler.py      # 连续批处理调度器（waiting/running/finished）
     ├── batch.py          # Batch（prefill 右 pad / decode 组装）
     ├── request.py        # Request 状态机
+    ├── sampling.py       # GPU 批量采样（batch top-k + Triton Gumbel-max）
     ├── graph_runner.py   # CUDA Graph 图池（decode 整步捕获，2 的幂 bucket）
     ├── kernels/          # Triton kernels（paged attention / flash varlen）
     └── weights.py        # safetensors 权重加载
