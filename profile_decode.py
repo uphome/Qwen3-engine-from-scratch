@@ -80,6 +80,8 @@ def main():
     args = parser.parse_args()
 
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)   # Triton / 图捕获按当前 device 校验指针
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     print("=" * 72)

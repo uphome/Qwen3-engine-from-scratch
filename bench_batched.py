@@ -261,6 +261,8 @@ def main():
     assert args.min_output_len <= args.max_output_len
 
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)   # Triton / 图捕获按当前 device 校验指针
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     seed(args.seed)

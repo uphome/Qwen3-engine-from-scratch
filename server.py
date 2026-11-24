@@ -31,6 +31,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
@@ -156,7 +157,29 @@ class Job:
         self.output_ids: list[int] = []
         self.finish_reason: str = ""
         self.error: str | None = None
+        self.submit_time = time.perf_counter()   # TTFT 起点
+        self.ttft: float | None = None           # 首 token 延迟（秒）
         self.done = threading.Event()
+
+
+class EngineMetrics:
+    """进程内指标：Engine 后台线程写、/metrics HTTP 线程读
+
+    线程安全说明：int 计数在 GIL 下读写原子；deque 快照在极端并发下
+    可能轻微不一致（监控指标允许，不需要加锁）。
+    """
+
+    TTFT_WINDOW = 256      # TTFT 滑动窗口样本数（summary 分位数近似）
+
+    def __init__(self):
+        self.start_time = time.perf_counter()
+        self.requests_total = 0       # 收到的 API 请求（不含 warmup）
+        self.finished_total = 0       # 成功完成
+        self.failed_total = 0         # 失败（容量拒绝 / 推理异常）
+        self.tokens_total = 0         # 累计生成 token 数
+        self.steps_total = 0          # 调度步数
+        self.last_batch_size = 0      # 最近一步批大小
+        self.ttfts: deque[float] = deque(maxlen=self.TTFT_WINDOW)
 
 
 class Engine:
@@ -177,6 +200,7 @@ class Engine:
         self._jobs: dict[int, Job] = {}     # request_id → job（finished 后移除）
         self._pending_blocks = 0            # 已入队未归还的块数记账
         self._next_id = 0
+        self.metrics = EngineMetrics()
         self._thread = threading.Thread(target=self.run, daemon=True)
 
     def start(self):
@@ -192,6 +216,11 @@ class Engine:
     # ---- 后台循环 ----
 
     def run(self):
+        # 后台线程的 CUDA current device 默认是 0：显式对齐到池所在设备，
+        # 否则多卡环境下 Triton kernel launch 会按 device 0 校验指针，
+        # 报 "Pointer argument ... cannot be accessed from Triton (cpu tensor?)"。
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         while True:
             # 无活可干 → 阻塞等新作业（避免忙轮询烧 CPU/GPU）
             if not self.scheduler.has_pending():
@@ -216,10 +245,15 @@ class Engine:
 
     def _dispatch(self, job: Job):
         """入队前容量校验（含已入队未归还的记账，防批内超卖）+ 组装 Request"""
+        track = job.request_id >= 0        # warmup job（-1）不计入指标
+        if track:
+            self.metrics.requests_total += 1
         input_len = job.input_ids.shape[1]
         needed = self._needed_blocks(input_len, job.max_new_tokens)
         available = self.pool.free_count - self._pending_blocks
         if needed > available:
+            if track:
+                self.metrics.failed_total += 1
             job.error = (
                 f"池容量不足: 剩余 {self.pool.free_count} 块, 已入队占用 "
                 f"{self._pending_blocks} 块, 请求需要 {needed} 块"
@@ -233,6 +267,8 @@ class Engine:
             )
             self.scheduler.add(req)      # 分配 PagedKVCache 行槽位
         except RuntimeError as e:
+            if track:
+                self.metrics.failed_total += 1
             job.error = f"入队失败: {e}"
             job.done.set()
             return
@@ -248,6 +284,8 @@ class Engine:
         batch = self.scheduler.schedule()
         if batch is None:
             return
+        self.metrics.steps_total += 1
+        self.metrics.last_batch_size = batch.size
         try:
             if batch.mode == "decode" and self.runner is not None:
                 # ---- decode 走 CUDA Graph：replay 替代 model 前向 ----
@@ -284,6 +322,14 @@ class Engine:
                 batch_logits, temperature=temperatures,
                 top_k=top_ks, top_p=top_ps).long()
 
+            # TTFT：本步将产出各请求的首 token（prefill 批；num_generated 仍为 0）
+            now = time.perf_counter()
+            for job, req in zip(batch_jobs, batch.requests):
+                if (job is not None and job.request_id >= 0
+                        and job.ttft is None and req.num_generated == 0):
+                    job.ttft = now - job.submit_time
+                    self.metrics.ttfts.append(job.ttft)
+
             self.scheduler.on_step_done(batch, next_tokens)
 
             # 完成者：收集输出 + 归还记账 + 通知 HTTP 线程
@@ -301,6 +347,9 @@ class Engine:
                                          >= req.max_new_tokens else "stop")
                     self._pending_blocks -= self._needed_blocks(
                         req.input_len, req.max_new_tokens)
+                    if job.request_id >= 0:      # warmup 不计入指标
+                        self.metrics.finished_total += 1
+                        self.metrics.tokens_total += len(job.output_ids)
                     log.log(REQUEST_LEVEL, f"完成 req#{req.request_id}: "
                              f"gen={req.num_generated}, reason={job.finish_reason}, "
                              f"pool_free={self.pool.free_count}")
@@ -311,6 +360,8 @@ class Engine:
             job_ids = [r.request_id for r in batch.requests]
             log.exception(f"推理步骤失败 (batch={batch.mode}, "
                           f"reqs={job_ids}): {e}")
+            self.metrics.failed_total += sum(
+                1 for r in batch.requests if r.request_id >= 0)
             for req in batch.requests:
                 job = self._jobs.pop(req.request_id, None)
                 if job is not None:
@@ -368,6 +419,82 @@ def _extract_tool_calls(text: str) -> list[dict] | None:
 # HTTP 层
 # ============================================================
 
+def render_metrics(engine, model_id: str = "") -> str:
+    """把 Engine 进程内状态渲染成 Prometheus 文本格式（text exposition 0.0.4）
+
+    零依赖：只是拼字符串，Prometheus 每 15s 来抓一次。
+    """
+    m = engine.metrics
+    sched = engine.scheduler
+    pool = engine.pool
+    used = pool.total_blocks - pool.free_count
+    ratio = used / pool.total_blocks if pool.total_blocks else 0.0
+
+    out: list[str] = []
+
+    def emit(name: str, typ: str, help_: str, samples: list[str]):
+        out.append(f"# HELP {name} {help_}")
+        out.append(f"# TYPE {name} {typ}")
+        out.extend(samples)
+
+    emit("engine_requests_total", "counter",
+         "收到的 API 请求数（不含 warmup）",
+         [f"engine_requests_total {m.requests_total}"])
+    emit("engine_requests_finished_total", "counter",
+         "成功完成的请求数",
+         [f"engine_requests_finished_total {m.finished_total}"])
+    emit("engine_requests_failed_total", "counter",
+         "失败的请求数（容量拒绝 / 推理异常）",
+         [f"engine_requests_failed_total {m.failed_total}"])
+    emit("engine_tokens_total", "counter",
+         "累计生成的 token 数",
+         [f"engine_tokens_total {m.tokens_total}"])
+    emit("engine_steps_total", "counter",
+         "调度步数（prefill + decode，含启动 warmup）",
+         [f"engine_steps_total {m.steps_total}"])
+    emit("engine_running", "gauge",
+         "正在 decode 的请求数",
+         [f"engine_running {len(sched.running)}"])
+    emit("engine_waiting", "gauge",
+         "等待调度的请求数",
+         [f"engine_waiting {len(sched.waiting)}"])
+    emit("engine_batch_size", "gauge",
+         "最近一个调度步的批大小",
+         [f"engine_batch_size {m.last_batch_size}"])
+    emit("engine_kv_used_ratio", "gauge",
+         "KV 池物理块占用率 (0-1)",
+         [f"engine_kv_used_ratio {ratio:.6f}"])
+    emit("engine_kv_free_blocks", "gauge",
+         "KV 池空闲物理块数",
+         [f"engine_kv_free_blocks {pool.free_count}"])
+    emit("engine_kv_total_blocks", "gauge",
+         "KV 池物理块总数",
+         [f"engine_kv_total_blocks {pool.total_blocks}"])
+    emit("engine_uptime_seconds", "gauge",
+         "进程运行时长（秒）",
+         [f"engine_uptime_seconds {time.perf_counter() - m.start_time:.3f}"])
+
+    # TTFT summary：分位数（滑动窗口）+ count/sum（Prometheus summary 惯例）
+    ttft_samples: list[str] = []
+    if m.ttfts:
+        vals = sorted(m.ttfts)
+        n = len(vals)
+        for q in (0.5, 0.95, 0.99):
+            idx = min(n - 1, int(q * (n - 1)))
+            ttft_samples.append(f'engine_ttft_seconds{{quantile="{q}"}} {vals[idx]:.6f}')
+        ttft_samples.append(f"engine_ttft_seconds_count {n}")
+        ttft_samples.append(f"engine_ttft_seconds_sum {sum(vals):.6f}")
+    emit("engine_ttft_seconds", "summary",
+         "首 token 延迟（提交 → 首个生成 token）", ttft_samples)
+
+    if model_id:
+        emit("engine_model_info", "gauge",
+             "模型元信息（值恒为 1）",
+             [f'engine_model_info{{model="{model_id}"}} 1'])
+
+    return "\n".join(out) + "\n"
+
+
 class OpenAIError(Exception):
     def __init__(self, code: int, message: str):
         super().__init__(message)
@@ -394,6 +521,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, code: int, body: str,
+                   content_type: str = "text/plain; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _error(self, code: int, message: str, etype: str = "invalid_request_error"):
         self._send_json(code, {"error": {"message": message, "type": etype,
                                          "code": code}})
@@ -417,6 +554,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "data": [{"id": srv.model_id, "object": "model",
                           "created": srv.created, "owned_by": "qwen3-engine"}],
             })
+        elif path == "/metrics":
+            srv = self.server
+            self._send_text(
+                200, render_metrics(srv.engine, srv.model_id),
+                "text/plain; version=0.0.4; charset=utf-8")
         else:
             self._error(404, f"未找到 {self.path}", "not_found")
 
@@ -600,6 +742,8 @@ def main():
 
     # ---- 设备 / 模型 ----
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)   # Triton kernel / 图捕获按当前 device 校验指针
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     log.info("=" * 60)
@@ -682,6 +826,7 @@ def main():
     log.info("")
     log.info("Listening on http://%s:%d", args.host, args.port)
     log.info("  GET  /v1/models")
+    log.info("  GET  /metrics              (Prometheus 指标)")
     log.info("  POST /v1/chat/completions   (OpenAI chat 格式)")
     log.info("  POST /v1/completions        (纯 prompt 格式)")
     log.info("  Ctrl+C 退出")

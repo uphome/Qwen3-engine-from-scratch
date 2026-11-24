@@ -50,6 +50,8 @@ def main():
         device = torch.device(f"cuda:{free_mem.index(max(free_mem))}")
     else:
         device = torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)   # Triton / 图捕获按当前 device 校验指针
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     print("=" * 60)

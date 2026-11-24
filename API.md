@@ -47,8 +47,36 @@ Listening on http://127.0.0.1:8000
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/v1/models` | 查询可用模型 |
+| `GET` | `/metrics` | Prometheus 指标（请求/tokens/KV/TTFT） |
 | `POST` | `/v1/chat/completions` | 对话补全（messages 格式） |
 | `POST` | `/v1/completions` | 纯文本补全（prompt 格式） |
+
+### 2.1 `/metrics`（Prometheus 文本格式）
+
+零依赖拼字符串，Prometheus 直接抓取。指标清单：
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `engine_requests_total` | counter | 收到的 API 请求数（不含 warmup） |
+| `engine_requests_finished_total` | counter | 成功完成数 |
+| `engine_requests_failed_total` | counter | 失败数（容量拒绝 / 推理异常） |
+| `engine_tokens_total` | counter | 累计生成 token 数 |
+| `engine_steps_total` | counter | 调度步数（含启动 warmup） |
+| `engine_running` / `engine_waiting` | gauge | 正在 decode / 等待调度的请求数 |
+| `engine_batch_size` | gauge | 最近一步批大小 |
+| `engine_kv_used_ratio` | gauge | KV 池物理块占用率（含图占位块） |
+| `engine_kv_free_blocks` / `engine_kv_total_blocks` | gauge | KV 池块数 |
+| `engine_uptime_seconds` | gauge | 进程运行时长 |
+| `engine_ttft_seconds` | summary | 首 token 延迟（p50/p95/p99 + count/sum） |
+| `engine_model_info{model=...}` | gauge | 模型元信息（值恒 1） |
+
+```bash
+curl http://127.0.0.1:8000/metrics
+# engine_running 0
+# engine_kv_used_ratio 0.011236
+# engine_ttft_seconds{quantile="0.5"} 0.043655
+# ...
+```
 
 ---
 

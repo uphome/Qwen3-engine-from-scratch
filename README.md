@@ -34,6 +34,9 @@ python server.py --model /path/to/Qwen3-0.6B --host 127.0.0.1 --port 8000
 # 查询模型
 curl http://127.0.0.1:8000/v1/models
 
+# Prometheus 指标（请求数 / tokens / KV 占用 / TTFT summary）
+curl http://127.0.0.1:8000/metrics
+
 # Chat 补全（OpenAI chat.completion 格式，逐请求独立 temperature/top_k/top_p）
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
      -H "Content-Type: application/json" \
