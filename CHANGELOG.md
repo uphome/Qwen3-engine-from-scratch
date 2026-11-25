@@ -34,6 +34,22 @@ sweep 交叉点：hist 1024 = 1.04x，hist 2048 = 1.57x。
 已知：bf16 下部分命中与全量 prefill 可能有个别贪心 token 翻转（数值差异）；
 CPU fp32 精确测试 max diff < 1e-4。
 
+### 阶段 2 代码审查修复
+
+- **bench_batched 缓存污染**：同一组 prompt 在 batch 扫描中会命中上一轮缓存，
+  吞吐数据失真；每轮 `run_batched` 前 `pool.clear_prefix_cache()`
+- `clear_prefix_cache` 修复：清空时必须同时从 LRU 移除（否则块重复计数，
+  池不变量 `free+cached+active == total` 被破坏）
+- **server HTTP 层容量预检删除**：按全量 prefill 预检会误拒可命中的请求
+  （503）；容量交给 Scheduler 精确裁决
+- **历史 KV 预取回退为逐层读取**：一次性 gather 所有层会让显存翻倍
+  （2k 历史 ≈ 235MB/请求），改为每层 fast gather（峰值 ~8MB）
+- 旧 `test/test_batched.py` / `profile_decode.py` 显式传 `mode`：
+  自动推断在 decode 输入带 `input_lens` 时会误判 prefill（mask=None 崩溃）
+- 完全命中且复用块为 0（单块 prompt）时 metrics 仍计命中；
+  warmup 不计入
+- Scheduler 容量错误消息与检查口径统一（含 decode 空间）
+
 ### 代码审查修复（前缀缓存 / SSE 交互）
 
 - `bench_batched.py` / `test/test_batched.py`：池闭环断言计入前缀缓存块

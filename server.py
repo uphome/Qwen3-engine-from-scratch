@@ -286,7 +286,9 @@ class Engine:
                 max_new_tokens=job.max_new_tokens, eos_token_id=job.eos_token_id,
             )
             hit_blocks = self.scheduler.add(req, self._pending_blocks)
-            if hit_blocks:
+            # 完全命中会直接进入 decoding（单块 prompt 的复用块数可能为 0），
+            # 部分命中进 waiting 且 hit_blocks > 0
+            if track and (hit_blocks or req.state == "decoding"):
                 self.metrics.prefix_cache_hits_total += 1
                 self.metrics.prefix_cache_hit_blocks_total += hit_blocks
         except RuntimeError as e:
@@ -657,12 +659,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if temperature < 0:
             raise OpenAIError(400, "temperature 不能为负")
 
-        # 容量预检（粗略；精确裁决在 Engine._dispatch 的记账里）
-        needed = (input_len + max_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE
-        if needed > srv.pool.free_count:
-            raise OpenAIError(
-                503, f"池剩余 {srv.pool.free_count} 块, 请求需要 {needed} 块; "
-                     f"请调小 max_tokens（当前约可用 {srv.pool.free_count * BLOCK_SIZE} tokens）")
+        # 容量由 Engine/Scheduler 精确裁决（前缀命中时不需要全量新块，
+        # HTTP 层按全量预检会误拒可命中的请求）
 
         job = Job(request_id=srv.engine._next_id, input_ids=input_ids,
                   max_new_tokens=max_tokens, temperature=temperature,

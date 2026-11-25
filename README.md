@@ -63,7 +63,7 @@ curl -X POST http://127.0.0.1:8000/v1/completions \
   客户端断开自动取消并归还 KV
 - 可观测：`GET /metrics`（Prometheus 文本格式，请求/tokens/KV/TTFT）
 - 前缀缓存：KV 跨请求复用（完全命中 + 部分命中；完全命中 TTFT 8.2x，
-  2k 历史部分命中 1.5x；设计见 [PREFIX_CACHE.md](PREFIX_CACHE.md)）
+  2k 历史部分命中 1.3-1.6x；设计见 [PREFIX_CACHE.md](PREFIX_CACHE.md)）
 - KV 池按剩余显存自动裁剪（`--kv-ratio`，默认 0.6 留 40% 给 prefill 瞬时激活；
   OOM 就调低，如 `--kv-ratio 0.5`）；推理中途 OOM 会返回 503 且服务不崩
 - 池满时新请求返回 503（不排队）

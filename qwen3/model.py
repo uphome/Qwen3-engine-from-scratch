@@ -180,14 +180,6 @@ class Qwen3Model(nn.Module):
                 causal_mask[valid | pad_keep] = 0
                 causal_mask = causal_mask.unsqueeze(1)   # (B, 1, S, S)
 
-        # 前缀缓存部分命中：层循环前一次性 gather 所有层历史（per 请求）
-        # 逐层 get_kv 会产生 2×L 次 index_select+reshape，CPU 提交成为瓶颈。
-        hist_kv = None
-        if caches is not None and not is_decode:
-            if any(c.seq_len > 0 for c in caches):
-                hist_kv = [c.get_kv_all() if c.seq_len > 0 else None
-                           for c in caches]
-
         # 提前计算 RoPE cos/sin（position_ids 已是逐请求独立的）
         position_embeddings = self.rotary_emb(position_ids)
 
@@ -197,7 +189,7 @@ class Qwen3Model(nn.Module):
         for i, layer in enumerate(self.layers):
             hidden_states = layer(hidden_states, causal_mask, position_embeddings,
                                   kv_cache=caches, layer_idx=i, input_lens=lens,
-                                  row_ids=row_ids, mode=mode, hist_kv=hist_kv)
+                                  row_ids=row_ids, mode=mode)
 
         # ---- ③ 逐请求推进缓存进度 ----
         # 每个请求的句柄是独立对象，必须逐个 advance（不能只推 caches[0]），

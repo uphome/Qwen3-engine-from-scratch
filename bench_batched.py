@@ -153,6 +153,9 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
     runner: GraphRunner | None。非 None 时 decode 步走 CUDA Graph
             （replay），prefill 步保持 eager（model 前向）。
     """
+    # 基准扫描用同一组 prompt：若不清空前缀缓存，第二轮起会全部命中，
+    # 吞吐被"缓存复用"污染（测不到纯调度/图性能）。每轮从干净状态开始。
+    kv_pool.clear_prefix_cache()
     scheduler = Scheduler(kv_pool, batch_size=batch_size)
     for i, (input_ids, max_new_tokens) in enumerate(specs):
         scheduler.add(Request(

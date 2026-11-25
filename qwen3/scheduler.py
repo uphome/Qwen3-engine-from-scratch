@@ -100,8 +100,8 @@ class Scheduler:
                     self.pool.release_block(b, h)
                 matched = []
             if matched:
-                new_pages = needed_total - len(matched)
-                if needed_full - len(matched) > self.pool.free_count - reserved_blocks:
+                new_pages = needed_full - len(matched)
+                if new_pages > self.pool.free_count - reserved_blocks:
                     raise RuntimeError(
                         f"[Scheduler] 池剩余 {self.pool.free_count} 块"
                         f"（已入队 {reserved_blocks}），"

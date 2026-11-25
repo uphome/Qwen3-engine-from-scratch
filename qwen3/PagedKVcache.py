@@ -193,6 +193,15 @@ class KVCachePool:
         self.block_refs[block_id] = 0
         self.free_block_ids.append(block_id)
 
+    def clear_prefix_cache(self):
+        """清空前缀缓存（基准测试每轮重置，避免同一组 prompt 命中污染对比）"""
+        while self._cached_lru:
+            blk, _ = self._cached_lru.popitem(last=False)
+            h = self._block_hashes.pop(blk, None)
+            if h is not None and self._prefix_index.get(h) == blk:
+                del self._prefix_index[h]
+            self._clear_and_free(blk)
+
     def _evict_cache(self):
         """LRU 淘汰超出上限的缓存块（清零后回空闲池）"""
         while len(self._cached_lru) > self.max_cached_blocks:
@@ -331,26 +340,6 @@ class PagedKVCache:
         v = torch.cat(v_pages, dim=1)[:, :self.seq_len, :]
 
         return k.unsqueeze(0), v.unsqueeze(0)   # [1, H, seq_len, D]
-
-    def get_kv_all(self):
-        """一次 gather 所有层的 K/V → (num_layers, Hkv, seq_len, D)
-
-        前缀缓存 prefill 每层都要读历史；逐层 gather 会产生 2×L 次
-        index_select + reshape（CPU 提交成为瓶颈）。层循环前一次性取回，
-        每层只做 view 切片。
-        """
-        if self.seq_len == 0 or not self.block_table:
-            return None
-        kbuf = self._pool.k_buffer
-        ids = torch.tensor(self.block_table, dtype=torch.long,
-                           device=kbuf.device)
-        k = kbuf[ids]                        # (P, L, Hkv, BS, D)
-        v = self._pool.v_buffer[ids]
-        L, Hkv, D = k.shape[1], k.shape[2], k.shape[4]
-        seq = self.seq_len
-        k = k.permute(1, 2, 0, 3, 4).reshape(L, Hkv, -1, D)[:, :, :seq]
-        v = v.permute(1, 2, 0, 3, 4).reshape(L, Hkv, -1, D)[:, :, :seq]
-        return k, v
 
     def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor):
         """将新 token 的 K, V 写入页中（向量化，一次写入所有 token）

@@ -74,7 +74,6 @@ class Qwen3Attention(nn.Module):
         input_lens: list[int] | None = None,     # prefill 批各请求有效长度（flash 路径用）
         row_ids: torch.Tensor | None = None,     # decode 批常驻 2D 块表行号（每步组装一次）
         mode: str | None = None,                 # "prefill" | "decode" | None（自动推断）
-        hist_kv=None,                            # 前缀缓存：各请求 (k_all, v_all)
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
@@ -127,8 +126,7 @@ class Qwen3Attention(nn.Module):
                     and os.environ.get("QWEN3_FLASH_ATTN", "triton") != "pytorch"
                 )
                 if hist_len > 0:
-                    hk = hist_kv[0][0][layer_idx].unsqueeze(0)
-                    hv = hist_kv[0][1][layer_idx].unsqueeze(0)
+                    hk, hv = kv_cache.get_kv(layer_idx)
                     attn_output = paged_attention_prefill_from_history(
                         q, k, v, hk, hv, self.scaling)
                 elif use_flash:
@@ -192,8 +190,7 @@ class Qwen3Attention(nn.Module):
                     for i, c in enumerate(caches):
                         li = lens[i]
                         if c.seq_len > 0:
-                            hk = hist_kv[i][0][layer_idx].unsqueeze(0)
-                            hv = hist_kv[i][1][layer_idx].unsqueeze(0)
+                            hk, hv = c.get_kv(layer_idx)
                         else:
                             hk = k[i:i + 1, :, :0]
                             hv = v[i:i + 1, :, :0]

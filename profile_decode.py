@@ -147,7 +147,8 @@ def main():
               f"kv_caches={len(caches)} 个请求\n")
         with torch.profiler.profile(activities=activities, record_shapes=True) as prof, \
                 torch.no_grad():
-            model(input_ids, kv_cache=caches, input_lens=b.input_lens)
+            model(input_ids, kv_cache=caches, input_lens=b.input_lens,
+                  mode=b.mode)
             if device.type == "cuda":
                 torch.cuda.synchronize()
         report(prof, args, device, "decode")
@@ -165,7 +166,8 @@ def main():
               f"batch={b.size}, lens={b.input_lens}\n")
         with torch.profiler.profile(activities=activities, record_shapes=True) as prof, \
                 torch.no_grad():
-            model(input_ids, kv_cache=caches, input_lens=b.input_lens)
+            model(input_ids, kv_cache=caches, input_lens=b.input_lens,
+                  mode=b.mode)
             if device.type == "cuda":
                 torch.cuda.synchronize()
         report(prof, args, device, "prefill")

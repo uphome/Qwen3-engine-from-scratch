@@ -34,7 +34,7 @@
 - [ ] 优先级调度 + 抢占（短请求优先 / 长请求让步）
 - [ ] 精确内存账本 + watermark 水位管理
 - [x] prefix caching 阶段 1：块哈希链 + ref/LRU + 完全命中快速路径（TTFT 8.24x）
-- [x] prefix caching 阶段 2：部分命中（后缀 prefill + attention 读历史 KV，TTFT 1.5x @2k）
+- [x] prefix caching 阶段 2：部分命中（后缀 prefill + attention 读历史 KV，TTFT 1.3-1.6x @2k）
 
 ### Kernel 层（P2-P3）
 - [ ] split-K decode kernel（页并行，长上下文 SM 利用率）
@@ -233,7 +233,7 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P0 | QKV/MLP 投影融合（3→1 kernel） | decode 每 token +4.6%~6.0% | 中 | [x] |
 | P1 | prefill K/V 写入 Triton（变长+跨页） | 消除 PyTorch scatter | 中 | [ ] |
 | P1 | prefix caching 阶段 1（完全命中） | TTFT 54.8 → 6.7ms（8.24x） | 中 | [x] |
-| P1 | prefix caching 阶段 2（部分命中） | 多轮对话：历史前缀复用（59.8→40.1ms） | 高 | [x] |
+| P1 | prefix caching 阶段 2（部分命中） | 多轮对话：历史前缀复用（59.5→45.6ms） | 高 | [x] |
 | P1 | SSE 流式输出 + 断开取消 | OpenAI 兼容 + TTFT 可测 | 中 | [x] |
 | P1 | `/metrics` 可观测性 | Prometheus 指标（含 TTFT） | 低 | [x] |
 | P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |

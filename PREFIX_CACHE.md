@@ -97,7 +97,7 @@ Scheduler.add(req)
 | `Batch.input_lens` | 返回后缀长度（模型按它推进 seq_len） |
 | `model.forward` | 显式 `mode` 判定（后缀 S=1 也不能误判 decode）；position_ids = `offset + arange(S)`；层前一次性预取历史 KV |
 | `attention`（prefill） | 有历史 → `paged_attention_prefill_from_history`：q=后缀，K/V = 历史 + 后缀，因果 mask 按全局位置（`offset + i`） |
-| `get_kv_all` | 一次 gather 所有层历史（逐层 gather 会产生 2×28 次小算子，CPU 提交瓶颈） |
+| `get_kv`（fast gather） | 每层一次高级索引 gather 历史（峰值 ~8MB/层，不做全历史副本） |
 
 **KV 写入**：`PagedKVCache.update` 从 `seq_len = matched_tokens` 开始写新块，
 共享前缀块保持只读；decode 从 L 继续写新块。
@@ -122,13 +122,12 @@ B: prompt = A 的 prompt + 16 新 token（129 块）
 
 | 历史 tokens | 全量 prefill | 部分命中 | 加速 |
 |---:|---:|---:|---:|
-| 128 | 34.1 ms | 35.5 ms | 0.96x |
-| 272 | 33.8 ms | 36.1 ms | 0.94x |
-| 512 | 34.9 ms | 37.1 ms | 0.94x |
-| 1024 | 36.2 ms | 34.7 ms | 1.04x |
-| 2048 | 57.1 ms | 36.4 ms | **1.57x** |
+| 128 | 35.0 ms | 37.0 ms | 0.95x |
+| 512 | 34.0 ms | 36.4 ms | 0.93x |
+| 1024 | 35.2 ms | 37.5 ms | 0.94x |
+| 2048 | 56.8 ms | 39.1 ms | **1.45x** |
 
-（Qwen3-0.6B / A100 / 后缀 16 tokens / bf16）
+（Qwen3-0.6B / A100 / 后缀 16 tokens / bf16；1024-1536 之间收益接近持平）
 
 所以默认阈值 `QWEN3_PREFIX_PARTIAL_MIN=1024`：命中前缀低于 1024 token 时
 释放命中块、回退全量 prefill，避免负收益；可通过环境变量调整（0 = 总是启用）。
@@ -153,11 +152,18 @@ B: prompt = A 的 prompt + 16 新 token（129 块）
 
 | 请求 | 路径 | TTFT |
 |---|---|---|
-| A（冷启动） | 全量 prefill 2048 | 117 ms（含首次编译） |
-| B（部分命中 2048/2064） | prefill 16 后缀 | **40.1 ms** |
-| C（关闭缓存，全量 2064） | 全量 prefill | 59.8 ms |
+| A（冷启动） | 全量 prefill 2048 | 120 ms（含首次编译） |
+| B（部分命中 2048/2064） | prefill 16 后缀 | **45.6 ms** |
+| C（关闭缓存，全量 2064） | 全量 prefill | 59.5 ms |
 
-**B vs C = 1.49x**；命中 128 块。
+**B vs C = 1.30x**；命中 128 块。
+
+HTTP 端到端（1501-token prompt，/v1/completions，命中 93 块）：
+
+| 请求 | 端到端延迟 |
+|---|---|
+| 第一次（冷） | 218 ms |
+| 第二次（部分命中 1488/1501） | **140 ms（1.56x）** |
 
 > 输出一致性说明：B 与 C 前 5 个 token 相同，第 5 个翻转。原因是
 > bf16 下不同 attention 实现（PyTorch 历史拼接 vs flash 全量）的
@@ -194,6 +200,7 @@ B: prompt = A 的 prompt + 16 新 token（129 块）
 | 限制 | 说明 |
 |---|---|
 | 部分命中的性能依赖长历史 | 阈值默认 1024；短历史自动回退全量（避免负收益） |
+| 历史读取逐层进行 | 不做全历史副本（预取会翻倍显存）；峰值 ~8MB/层 |
 | LRU 淘汰可能切断前缀链 | 缓存上限 75%；长前缀超出容量时可能淘汰链头导致命中变短（阶段 3 可做链感知淘汰） |
 | 容量记账 | 命中块从新块需求中扣除；完全命中时 COW 私有块计为新块 |
 | 无跨进程持久化 | 缓存随进程生命周期 |

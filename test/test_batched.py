@@ -74,7 +74,7 @@ def run_scheduler(model, config, requests, batch_size=2):
         input_ids = batch.build_input_ids()
         kv_caches = batch.build_kv_caches()
         logits = model(input_ids, kv_cache=kv_caches,
-                       input_lens=batch.input_lens)
+                       input_lens=batch.input_lens, mode=batch.mode)
         last_idx = torch.tensor(batch.input_lens, dtype=torch.long) - 1
         next_tokens = logits[torch.arange(last_idx.shape[0]), last_idx] \
             .argmax(dim=-1, keepdim=True)  # 贪心
