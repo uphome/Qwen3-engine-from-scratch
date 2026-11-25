@@ -5,6 +5,17 @@
 
 ---
 
+## 2026-11-25 — 学习文档（4 篇）
+
+- `docs/LEARN_01_STREAMING.md`：SSE 协议、跨线程 token 队列、增量解码、断开取消
+- `docs/LEARN_02_PREFIX_CACHE.md`：块哈希链、ref/链感知 LRU、完全/部分命中、COW
+- `docs/LEARN_03_SCHEDULING.md`：状态机、组批、chunked prefill、容量记账
+- `docs/LEARN_04_TESTING_BENCH.md`：四层测试、CI、TTFT/TPOT 口径、压测与长稳
+- 每篇：概念 → 代码逐段 → 设计取舍 → 踩坑复盘 → 动手实验 → 自测问题
+- `docs/README.md` 索引；README 增加文档入口
+
+---
+
 ## 2026-11-25 — 功能补齐：流式增量解码 / 链感知 LRU / chunked prefill
 
 ### HTTP 流式增量解码

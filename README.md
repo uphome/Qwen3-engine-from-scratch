@@ -156,6 +156,16 @@ python scripts/make_bench_report.py --engine-json results/engine.json \
 
 已有指标：吞吐（tok/s）、延迟分布（p50/p95/p99）、VRAM 占用、Prefill/Decode 占比、算子级 CUDA 耗时排名。
 
+## 文档
+
+- [docs/](docs/) — **学习文档（4 篇，结合代码逐段讲解）**：流式 / 前缀缓存 / 调度 / 测试压测
+- [API.md](API.md) — OpenAI 兼容 API 与 `/metrics`
+- [PREFIX_CACHE.md](PREFIX_CACHE.md) — 哈希 KV 复用（完全/部分命中）
+- [TESTING.md](TESTING.md) — 测试矩阵与压测复现
+- [BENCHMARK.md](BENCHMARK.md) — 压测报告
+- [ENGINE_COMPARISON.md](ENGINE_COMPARISON.md) — 与工业级引擎的差距与路线图
+- [PERFORMANCE.md](PERFORMANCE.md) — 版本性能演进
+
 ## 致谢
 
 - [Qwen3](https://github.com/QwenLM/Qwen3) — Qwen3 模型架构与权重
