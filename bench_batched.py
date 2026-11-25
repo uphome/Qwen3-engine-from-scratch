@@ -16,6 +16,7 @@
 """
 
 import argparse
+import json
 import os
 import time
 from random import randint, seed
@@ -117,6 +118,7 @@ def run_serial(model, kv_pool, specs, temperature=0.0,
     prefill_ms = 0.0
     decode_ms = 0.0
     latencies: list[float] = []
+    ttfts: list[float] = []
     n_tokens = 0
 
     for input_ids, max_new_tokens in specs:
@@ -134,6 +136,7 @@ def run_serial(model, kv_pool, specs, temperature=0.0,
         n_tokens += output_ids.shape[1] - input_ids.shape[1]
         if stats["step_times"]:
             prefill_ms += stats["step_times"][0] * 1000
+            ttfts.append(stats["step_times"][0])
             decode_ms += sum(stats["step_times"][1:]) * 1000
 
     total_s = time.perf_counter() - t0
@@ -141,7 +144,7 @@ def run_serial(model, kv_pool, specs, temperature=0.0,
         "mode": "serial", "batch_size": 1,
         "total_s": total_s, "n_tokens": n_tokens,
         "prefill_ms": prefill_ms, "decode_ms": decode_ms,
-        "latencies": latencies,
+        "latencies": latencies, "ttfts": ttfts,
     }
 
 
@@ -169,6 +172,7 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
     n_prefill_steps = 0
     n_decode_steps = 0
     finish_times: list[float] = []
+    ttfts: list[float] = []
 
     while scheduler.has_pending():
         batch = scheduler.schedule()
@@ -210,6 +214,10 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
         if batch.mode == "prefill":
             prefill_ms += dt * 1000
             n_prefill_steps += 1
+            # TTFT：请求全部在同一时刻到达（离线批到达），
+            # prefill 批完成即该批各请求的首 token 产出时刻
+            now = time.perf_counter()
+            ttfts.extend([now - t0] * batch.size)
         else:
             decode_ms += dt * 1000
             n_decode_steps += 1
@@ -226,7 +234,7 @@ def run_batched(model, kv_pool, specs, batch_size, temperature=0.0,
         "total_s": total_s, "n_tokens": n_tokens,
         "prefill_ms": prefill_ms, "decode_ms": decode_ms,
         "n_prefill_steps": n_prefill_steps, "n_decode_steps": n_decode_steps,
-        "latencies": finish_times,
+        "latencies": finish_times, "ttfts": ttfts,
     }
 
 
@@ -248,6 +256,9 @@ def main():
                         help="batch_size 扫描上限: 1,2,...,max-batch (default: 8)")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="只跑指定 batch_size（跳过扫描）")
+    parser.add_argument("--batch-sizes", type=str, default=None,
+                        help="指定 batch_size 列表（逗号分隔，优先于扫描），"
+                             "如 1,2,4,8,16,28")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0,
@@ -258,6 +269,8 @@ def main():
                         help="跑正式基准前预热（推荐 GPU 上开启）")
     parser.add_argument("--no-graph", action="store_true",
                         help="禁用 CUDA Graph decode（默认开，QWEN3_CUDA_GRAPH=0 亦可）")
+    parser.add_argument("--json-out", type=str, default=None,
+                        help="把结果保存为 JSON（压测报告用）")
     args = parser.parse_args()
 
     assert args.min_input_len <= args.max_input_len
@@ -303,8 +316,12 @@ def main():
     # ---- CUDA Graph（decode 图池）----
     # 开关：--no-graph 或 QWEN3_CUDA_GRAPH=0 关闭（默认开）。
     # 构造时捕获 buckets 张图（占位句柄常驻 pool，预留少量块 + 哑行 1 块）。
-    batch_sizes = ([args.batch_size] if args.batch_size is not None
-                   else list(range(1, args.max_batch + 1)))
+    if args.batch_sizes:
+        batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
+    elif args.batch_size is not None:
+        batch_sizes = [args.batch_size]
+    else:
+        batch_sizes = list(range(1, args.max_batch + 1))
     use_graph = (
         device.type == "cuda" and not args.no_graph
         and os.environ.get("QWEN3_CUDA_GRAPH", "1") != "0"
@@ -320,7 +337,7 @@ def main():
     # ---- KV 池（块数按最大并发 batch 备足；graph 占位句柄 + 哑行各 1 块）----
     block_size = 16
     max_seq_tokens = args.max_input_len + args.max_output_len
-    max_batch = args.max_batch if args.batch_size is None else args.batch_size
+    max_batch = max(batch_sizes)
     blocks_per_seq = (max_seq_tokens + block_size - 1) // block_size
     num_blocks = max(128, blocks_per_seq * min(max_batch, args.num_seqs)
                      + (max(graph_buckets) + 1 if use_graph else 0))
@@ -385,11 +402,15 @@ def main():
     print("=" * 72)
 
     headers = ["Mode", "Batch", "Steps", "Prefill(s)", "Decode(s)",
-               "Total(s)", "Throughput", "Decode", "Lat p50", "Lat p95"]
+               "Total(s)", "Throughput", "TTFT p50", "TTFT p95",
+               "TPOT", "Decode", "Lat p50", "Lat p95"]
     rows = []
     for r in results:
         tok_s = r["n_tokens"] / r["total_s"] if r["total_s"] else 0.0
         decode_per_tok = (r["decode_ms"] / r["n_tokens"]) if r["n_tokens"] else 0.0
+        # TPOT：decode 总时间 / 非首 token 数（每请求首 token 计入 TTFT）
+        n_decode = max(1, r["n_tokens"] - max(1, r["batch_size"]))
+        tpot = r["decode_ms"] / n_decode
         rows.append([
             r["mode"],
             str(r["batch_size"]),
@@ -399,11 +420,31 @@ def main():
             f'{r["decode_ms"] / 1000:.2f}',
             f'{r["total_s"]:.2f}',
             f"{tok_s:.1f} tok/s",
+            f'{percentile(r["ttfts"], 50) * 1000:.1f}ms',
+            f'{percentile(r["ttfts"], 95) * 1000:.1f}ms',
+            f"{tpot:.2f} ms",
             f"{decode_per_tok:.1f} ms/tok",
             f'{percentile(r["latencies"], 50):.2f}s',
             f'{percentile(r["latencies"], 95):.2f}s',
         ])
     print(format_table(headers, rows))
+
+    # ---- JSON 输出（供报告脚本消费）----
+    if args.json_out:
+        payload = {
+            "meta": {
+                "model": args.model, "device": str(device),
+                "num_seqs": args.num_seqs,
+                "input_len": [args.min_input_len, args.max_input_len],
+                "output_len": [args.min_output_len, args.max_output_len],
+                "seed": args.seed, "graph": use_graph,
+                "n_reserved_blocks": n_reserved,
+            },
+            "results": results,
+        }
+        with open(args.json_out, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\n[json] 结果已保存: {args.json_out}")
 
     # 加速比
     print("\n--- Speedup vs serial ---")

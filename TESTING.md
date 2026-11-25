@@ -61,6 +61,37 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 - **真实数值对比优先**：kernel 改动对比 PyTorch 参考实现；执行路径改动对比 eager。
 - **测试不依赖网络**：不下载模型；需要权重时用微型随机模型（`tiny_model` fixture）。
 
+## 压测工具
+
+| 工具 | 用途 | 输出 |
+|---|---|---|
+| `bench_batched.py` | 引擎级：并发梯度、TTFT/TPOT、p50/p95 | 终端表格 + `--json-out` |
+| `bench_server.py` | HTTP：并发梯度 / 长稳、QPS、TTFT（流式）、错误率 | 终端表格 + `--json-out` |
+| `scripts/make_bench_report.py` | 从 JSON 生成 `BENCHMARK.md` + 曲线图 | Markdown + PNG |
+
+复现（当前 `BENCHMARK.md` 数据）：
+
+```bash
+# 1) 引擎
+python bench_batched.py --model /data/hjt1/Qwen3-0.6B --num-seqs 32 \
+    --min-input-len 32 --max-input-len 256 --min-output-len 32 --max-output-len 128 \
+    --batch-sizes 1,2,4,8,16,28 --warmup --json-out results/engine.json
+
+# 2) HTTP（另开终端启动 server.py）
+python server.py --model /data/hjt1/Qwen3-0.6B --port 8767 --batch-size 8
+python bench_server.py --url http://127.0.0.1:8767 --num-requests 32 \
+    --concurrency 1,2,4,8 --max-tokens 64 --stream --json-out results/server.json
+
+# 3) 长稳（120s 示例；正式可 1800s）
+python bench_server.py --url http://127.0.0.1:8767 --duration 120 \
+    --concurrency 8 --max-tokens 64 --stream --json-out results/stability.json
+
+# 4) 报告
+python scripts/make_bench_report.py --engine-json results/engine.json \
+    --server-json results/server.json --stability-json results/stability.json \
+    --out BENCHMARK.md --figdir benchmark
+```
+
 ## 后续（按路线图）
 
 - prefix caching（哈希 KV）：命中率 / 共享块生命周期 / 跨对话复用收益

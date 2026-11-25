@@ -5,6 +5,24 @@
 
 ---
 
+## 2026-11-25 — 压测体系（引擎 / HTTP / 长稳 / 报告）
+
+### 新增
+
+- `bench_batched.py`：TTFT（含离线排队，注明口径）、TPOT、`--json-out`、
+  `--batch-sizes`（按梯度而非全扫描）；每轮 run 前清空前缀缓存（防污染）；
+  修复 `--batch-sizes` 未参与池容量计算导致的 OOM
+- `bench_server.py`：HTTP 压测（零依赖）
+  - 并发梯度、QPS、tok/s、流式精确 TTFT、端到端延迟、错误率
+  - 长稳模式（`--duration` + 每 30s 窗口统计，逐请求实时上报）
+- `scripts/make_bench_report.py`：JSON → `BENCHMARK.md` + 曲线图（matplotlib）
+- `BENCHMARK.md`：首次完整报告（引擎/HTTP/长稳 + 5 张图）
+  - 引擎 32 序列：batch=28 **1592.8 tok/s**、TTFT p50 167.8ms、TPOT 0.51ms
+  - HTTP 并发 1→8：131.8 → **668.5 tok/s**，0 错误，TTFT 42.7 → 88.1ms
+  - 长稳 120s（并发 8）：**1206 请求 0 错误**、514 tok/s、窗口吞吐无衰减
+
+---
+
 ## 2026-11-24 — 工程化：测试地基 + /metrics + SSE 流式
 
 ### 新增：前缀缓存（Prefix Cache，阶段 1+2：完全 / 部分命中）

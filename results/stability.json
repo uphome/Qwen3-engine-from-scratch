@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "url": "http://127.0.0.1:8767",
+    "prompt_chars": 1575,
+    "prompt_repeat": 35,
+    "stream": true,
+    "max_tokens": 64,
+    "duration": 120
+  },
+  "results": [
+    {
+      "requests": 1206,
+      "ok": 1206,
+      "errors": 0,
+      "error_rate": 0.0,
+      "wall_s": 150.1551862070337,
+      "qps": 8.031690615981585,
+      "tokens_per_s": 514.0281994228214,
+      "n_tokens": 77184,
+      "ttft_p50_ms": 93.63746643066406,
+      "ttft_p95_ms": 162.60125138796866,
+      "lat_p50_ms": 797.1294783055782,
+      "lat_p95_ms": 850.1020090188831,
+      "lat_p99_ms": 867.7851643413304,
+      "error_samples": [],
+      "concurrency": 8,
+      "duration_s": 120,
+      "stream": true,
+      "max_tokens": 64,
+      "windows": [
+        {
+          "t": 30.0,
+          "requests": 296,
+          "ok": 296,
+          "errors": 0,
+          "tokens": 18944
+        },
+        {
+          "t": 60.1,
+          "requests": 600,
+          "ok": 600,
+          "errors": 0,
+          "tokens": 38400
+        },
+        {
+          "t": 90.1,
+          "requests": 904,
+          "ok": 904,
+          "errors": 0,
+          "tokens": 57856
+        },
+        {
+          "t": 120.1,
+          "requests": 1198,
+          "ok": 1198,
+          "errors": 0,
+          "tokens": 76672
+        },
+        {
+          "t": 150.2,
+          "requests": 1206,
+          "ok": 1206,
+          "errors": 0,
+          "tokens": 77184
+        }
+      ]
+    }
+  ]
+}

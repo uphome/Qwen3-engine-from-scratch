@@ -81,9 +81,13 @@ curl -X POST http://127.0.0.1:8000/v1/completions \
 ├── bench.py              # 吞吐基准测试 + torch.profiler trace 导出
 ├── bench_batched.py      # 连续批处理基准（Scheduler 调度，decode 走 CUDA Graph）
 ├── bench_sampling.py     # GPU 采样微基准
-├── bench_server_sampling.py  # HTTP 服务端采样压测
+├── bench_server.py       # HTTP 压测（并发梯度 / TTFT / 长稳）
+├── bench_server_sampling.py  # HTTP 服务端采样压测（旧）
 ├── profile_decode.py     # prefill/decode 步 kernel 时间剖析
-├── scripts/              # 工具脚本（模型下载等）
+├── scripts/              # 工具脚本（模型下载 / 压测报告生成）
+├── BENCHMARK.md          # 压测报告（自动生成）
+├── benchmark/            # 压测曲线（PNG）
+├── results/              # 压测原始 JSON
 ├── tests/                # 正式测试（pytest，CPU/GPU 分层）
 └── qwen3/                # 核心模型
     ├── config.py         # Qwen3Config — 纯数据类
@@ -129,6 +133,23 @@ python bench_batched.py --model /path/to/Qwen3-0.6B --batch-size 8 --no-graph
 
 # 单请求基准（bench.py 串行也走图，与 main.py 同路径）
 python bench.py --model /path/to/Qwen3-0.6B --num-seqs 64 --no-graph
+
+# 引擎压测：并发梯度 + TTFT/TPOT + JSON（报告用）
+python bench_batched.py --model /path/to/Qwen3-0.6B --num-seqs 32 \
+    --batch-sizes 1,2,4,8,16,28 --warmup --json-out results/engine.json
+
+# HTTP 压测：并发梯度 / 流式 TTFT / 错误率（先启动 server.py）
+python bench_server.py --url http://127.0.0.1:8000 --num-requests 32 \
+    --concurrency 1,2,4,8 --max-tokens 64 --stream --json-out results/server.json
+
+# 长稳测试（每 30s 窗口统计）
+python bench_server.py --url http://127.0.0.1:8000 --duration 1800 \
+    --concurrency 8 --max-tokens 64 --stream --json-out results/stability.json
+
+# 生成压测报告（Markdown + 曲线图）
+python scripts/make_bench_report.py --engine-json results/engine.json \
+    --server-json results/server.json --stability-json results/stability.json \
+    --out BENCHMARK.md --figdir benchmark
 ```
 
 已有指标：吞吐（tok/s）、延迟分布（p50/p95/p99）、VRAM 占用、Prefill/Decode 占比、算子级 CUDA 耗时排名。
