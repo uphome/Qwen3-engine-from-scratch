@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-11-25 — 功能补齐：流式增量解码 / 链感知 LRU / chunked prefill
+
+### HTTP 流式增量解码
+
+- 之前每 token 对**累计 ids** 全量 decode（O(n²)）；改为只 decode 未输出 token
+- BPE 跨 token 的 UTF-8 字节：decode 出现 U+FFFD 时暂存，待补齐再输出
+  （e2e 断言无替换字符）；8 token 上限防异常卡死
+
+### 前缀缓存：链感知 LRU
+
+- 淘汰时优先选**叶节点**（无子块），避免淘汰链头后整条前缀无法命中
+- 维护 `hash -> 子块集合 / 块 -> 父 hash`；测试：A→B→C 链 + 无关块、
+  上限 3 时淘汰 C，保留 A/B（命中 2 块而非 0）
+
+### chunked prefill（长 prompt 切片）
+
+- `Scheduler(chunk_size=512)`（`QWEN3_CHUNK_SIZE` 可调，0 = 关闭）
+- 长 prompt 分多个调度步 prefill，**prefill chunk 与 decode 交替**，
+  长 prefill 不再让已运行请求停顿整段
+- 中间 chunk 不采样（避免伪 token）；TTFT 只在最后一个 chunk 记录
+- 复用阶段 2 的 paged prefill（chunk 读历史 KV）+ position offset
+- 实测（2048 长 prompt + 短请求并发，禁用前缀缓存隔离）：
+  · 短请求 TTFT **182.5 → 66.9ms（2.73x）**
+  · 短请求完成时间 382 → 413ms（0.92x，decode 与 chunk 交替的权衡）
+  · 长请求 TTFT 182 → 239ms（0.76x，chunk 间插入 decode）
+  · 输出与整段 prefill 完全一致（测试覆盖）
+
+---
+
 ## 2026-11-25 — 压测体系（引擎 / HTTP / 长稳 / 报告）
 
 ### 新增

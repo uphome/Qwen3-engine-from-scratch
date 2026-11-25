@@ -53,7 +53,9 @@ FINISHED = "finished"      # EOS / 达上限，KV 物理块已归还
 #   finished  → （终点，不可再迁移）
 _VALID_TRANSITIONS = {
     WAITING: (PREFILLING,),
-    PREFILLING: (DECODING,),
+    # chunked prefill：长 prompt 分多个调度步 prefill，
+    # 未完成时状态保持 prefilling（允许自迁移）
+    PREFILLING: (DECODING, PREFILLING),
     DECODING: (DECODING, FINISHED),
     FINISHED: (),
 }
@@ -97,9 +99,11 @@ class Request:
         # 前缀缓存完全命中：首个 decode 输入 = prompt 最后一个 token
         # （命中跳过 prefill，没有 output_ids，靠它启动自回归）
         self.prefill_last_token: int | None = None
-        # 前缀缓存部分命中：prefill 只送 input_ids[:, prefill_offset:]
-        # （offset = 命中块数 × block_size，块对齐）
+        # 前缀缓存部分命中 / chunked prefill：
+        # prefill 只送 input_ids[:, prefill_offset:prefill_end]
+        # （前缀缓存时 offset = 命中块数 × block_size；chunk 时 end 为本步终点）
         self.prefill_offset: int = 0
+        self.prefill_end: int = self.input_len
 
     # ============================================================
     # 状态查询（只读，不修改任何字段）

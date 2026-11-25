@@ -354,8 +354,13 @@ class Engine:
             # TTFT：本步将产出各请求的首 token（prefill 批；num_generated 仍为 0）
             now = time.perf_counter()
             for job, req in zip(batch_jobs, batch.requests):
+                # chunked prefill 的中间 chunk 不产出首 token：
+                # 只有最后一个 chunk（或 decode 批）才记录 TTFT
+                is_first_token = (batch.mode == "decode"
+                                  or req.prefill_end >= req.input_len)
                 if (job is not None and job.request_id >= 0
-                        and job.ttft is None and req.num_generated == 0):
+                        and job.ttft is None and req.num_generated == 0
+                        and is_first_token):
                     job.ttft = now - job.submit_time
                     with self.metrics.lock:
                         self.metrics.ttfts.append(job.ttft)
@@ -755,23 +760,33 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if chat:
             emit({"role": "assistant", "content": ""})
 
-        ids: list[int] = []
-        sent_text = ""
+        # 流式增量解码：只 decode 尚未输出的 token（通常 1 个），
+        # 避免每个 token 都对累计 ids 全量 decode（O(n²)）。
+        # BPE token 可能是不完整 UTF-8 字节（中文/emoji 跨 token）：
+        # decode 结果含 U+FFFD 时先暂存，等后续 token 补齐字节再输出。
+        pending: list[int] = []
         n_tokens = 0
         finish_reason = "stop"
         tok = first
         try:
             while tok is not None:
-                ids.append(tok)
+                pending.append(tok)
                 n_tokens += 1
-                # 增量解码：对累计 ids decode 后取新增后缀，
-                # 避免多字节 UTF-8 被 token 边界拆开产生乱码
-                text = srv.tokenizer.decode(ids, skip_special_tokens=True)
-                delta = text[len(sent_text):]
-                sent_text = text
-                if delta:
-                    emit({"content": delta})
+                text = srv.tokenizer.decode(pending, skip_special_tokens=True)
+                if "\ufffd" not in text:
+                    if text:
+                        emit({"content": text})
+                    pending = []
+                elif len(pending) >= 8:
+                    # 防御：异常 token 序列迟迟不完整，强制输出避免卡住
+                    emit({"content": text})
+                    pending = []
                 tok = job.token_queue.get(timeout=WAIT_TIMEOUT)
+
+            if pending:                    # 生成结束时仍未补齐（极少见）
+                tail = srv.tokenizer.decode(pending, skip_special_tokens=True)
+                if tail:
+                    emit({"content": tail})
 
             if job.error:                    # 推流中途异常：发 error 事件后收尾
                 self._sse_send({"error": {"message": job.error,

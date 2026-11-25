@@ -31,9 +31,16 @@ from .PagedKVcache import KVCachePool, PagedKVCache
 
 
 class Scheduler:
-    def __init__(self, pool: KVCachePool, batch_size: int = 1):
+    def __init__(self, pool: KVCachePool, batch_size: int = 1,
+                 chunk_size: int | None = None):
         self.pool = pool
         self.batch_size = batch_size
+        # chunked prefill：每步最多 prefill chunk_size 个 token（0 = 关闭）。
+        # 默认 512（vLLM 同款量级）；长 prompt 切片后不会卡住 decode。
+        if chunk_size is None:
+            chunk_size = int(os.environ.get("QWEN3_CHUNK_SIZE", "512"))
+        self.chunk_size = max(0, chunk_size)
+        self._prefill_turn = False   # 上一步是否 prefill（与 decode 交替）
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.finished: list[Request] = []
@@ -138,10 +145,15 @@ class Scheduler:
     # ---- 每步调度 ----
 
     def schedule(self) -> Batch | None:
-        """挑出本步执行的请求集合（要么全 prefill，要么全 decode）"""
+        """挑出本步执行的请求集合（要么全 prefill，要么全 decode）
+
+        chunked prefill 的节奏：running 非空时 prefill / decode 交替，
+        保证长 prompt 的切片不会让已运行请求的 decode 停顿整个 prefill。
+        """
         if self.running:
-            # running 有空位且 waiting 有人 → 先做 prefill 补位
-            if len(self.running) < self.batch_size and self.waiting:
+            # running 有空位且 waiting 有人：prefill 补位（与 decode 交替）
+            if (len(self.running) < self.batch_size and self.waiting
+                    and not self._prefill_turn):
                 return self._schedule_prefill()
             return self._schedule_decode()
 
@@ -162,11 +174,17 @@ class Scheduler:
         reqs = [self.waiting.popleft() for _ in range(n)]
         for req in reqs:
             req.start_prefill()
+            # chunked prefill：本步只 prefill 一段（chunk_size=0 则整段）
+            remaining = req.input_len - req.prefill_offset
+            take = remaining if self.chunk_size <= 0 else min(self.chunk_size, remaining)
+            req.prefill_end = req.prefill_offset + take
+        self._prefill_turn = True
         return Batch("prefill", reqs)
 
     def _schedule_decode(self) -> Batch:
         # 批内所有 running 一起 decode（最多 batch_size 个，超出留到下一步）
         n = min(self.batch_size, len(self.running))
+        self._prefill_turn = False
         return Batch("decode", self.running[:n])
 
     # ---- 收尾 ----
@@ -177,17 +195,27 @@ class Scheduler:
         next_tokens: (B, 1) 批内每个请求采样出的下一个 token
         """
         for i, req in enumerate(batch.requests):
-            req.append(next_tokens[i].item())
+            # chunked prefill：中间 chunk 的 logits 只是"半截上下文"的产物，
+            # 不能作为首 token（否则输出会多出伪 token）；但收尾逻辑照常执行
+            is_partial_chunk = (batch.mode == "prefill"
+                                and req.prefill_end < req.input_len)
+            if not is_partial_chunk:
+                req.append(next_tokens[i].item())
 
             if batch.mode == "prefill":
-                # prefill 完成：记录完整 prompt 块的哈希（free 时登记前缀缓存）
+                # 记录完整 prompt 块的哈希（free 时登记前缀缓存）
                 cache = req.kv_cache
                 for i, h in enumerate(req.prefix_hashes):
                     if i < len(cache.block_hashes):
                         cache.block_hashes[i] = h
-                # 进入自回归，等待下一批 decode
-                req.enter_decoding()
-                self.running.append(req)
+                req.prefill_offset = req.prefill_end
+                if req.prefill_offset < req.input_len:
+                    # chunked prefill 还有剩余：放回队头继续（状态保持 prefilling）
+                    self.waiting.appendleft(req)
+                else:
+                    # 整段 prefill 完成：进入自回归
+                    req.enter_decoding()
+                    self.running.append(req)
             else:
                 # decode 步：结束后判定出批并归还 KV 块
                 if req.is_finished():

@@ -257,3 +257,27 @@ def test_pool_accounting_after_mixed_traffic(kv_pool_factory):
 
     assert pool.free_count + pool.cached_count == pool.total_blocks
     assert pool.cached_count == 2
+
+
+def test_chain_aware_eviction_keeps_prefix_chain(kv_pool_factory):
+    """淘汰优先选链尾：保留 A→B 前缀链，而不是淘汰链头导致命中 0 块"""
+    pool = kv_pool_factory(num_blocks=8, max_seq_len=64)
+    pool.max_cached_blocks = 3
+
+    # 同一条 prompt 的 3 块哈希链 A → B → C
+    hashes = compute_prefix_hashes(list(range(48)), BS)     # 3 块
+    # 另一个 prompt 的 1 块（无关叶节点）
+    other = compute_prefix_hashes([9000 + i for i in range(16)], BS)[0]
+
+    blocks = pool.alloc(4)
+    for i in range(3):
+        parent = hashes[i - 1] if i > 0 else 0
+        pool.release_block(blocks[i], hashes[i], parent)
+    pool.release_block(blocks[3], other, 0)   # 第 4 块触发淘汰
+
+    # 上限 3：应淘汰 C（链尾）或 D，保留 A、B（前缀链完整）
+    hit = pool.match_prefix_partial(hashes)
+    assert len(hit) == 2, f"链感知淘汰失效：命中 {len(hit)} 块（期望 2）"
+    assert pool._children.get(hashes[0]), "A 的子块应为 B"
+    for b, h in zip(hit, hashes):
+        pool.release_block(b, h, hashes[hashes.index(h) - 1] if hashes.index(h) else 0)

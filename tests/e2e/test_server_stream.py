@@ -106,6 +106,7 @@ def test_stream_matches_non_stream(server_url):
 
     assert done
     assert stream_text == normal_text
+    assert "\ufffd" not in stream_text, "增量解码出现替换字符（UTF-8 被拆坏）"
 
 
 def test_stream_chunk_format(server_url):

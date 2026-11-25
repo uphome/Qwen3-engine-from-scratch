@@ -43,8 +43,9 @@ class Batch:
         """
         if self.mode == "decode":
             return [1] * self.size
-        # 前缀缓存部分命中：只送未命中后缀，长度 = input_len - prefill_offset
-        return [r.input_len - r.prefill_offset for r in self.requests]
+        # 前缀缓存部分命中 / chunked prefill：只送
+        # [prefill_offset, prefill_end) 这一段
+        return [r.prefill_end - r.prefill_offset for r in self.requests]
 
     def build_input_ids(self) -> torch.Tensor:
         """批内 input_ids: (B, S)
@@ -55,8 +56,10 @@ class Batch:
         if self.mode == "decode":
             return torch.cat([r.cur_token for r in self.requests], dim=0)
 
-        # 前缀缓存部分命中：跳过已复用的前缀块，只送后缀
-        parts = [r.input_ids[0, r.prefill_offset:] for r in self.requests]
+        # 前缀缓存部分命中 / chunked prefill：
+        # 跳过已复用的前缀块，只送 [prefill_offset, prefill_end)
+        parts = [r.input_ids[0, r.prefill_offset:r.prefill_end]
+                 for r in self.requests]
         S_max = max(p.shape[0] for p in parts)
         padded = torch.full(
             (self.size, S_max), self.PAD_ID, dtype=torch.long,

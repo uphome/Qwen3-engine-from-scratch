@@ -66,6 +66,10 @@ class KVCachePool:
         self._prefix_index: dict[int, int] = {}
         self._block_hashes: dict[int, int] = {}
         self._cached_lru: OrderedDict[int, None] = OrderedDict()
+        # 链感知淘汰：hash → 子块 hash 集合 / 块 → 父 hash。
+        # 淘汰时优先选"叶节点"（无子块），避免淘汰链头后整条前缀无法命中。
+        self._children: dict[int, set[int]] = {}
+        self._block_parents: dict[int, int] = {}
         # 缓存上限：75% 物理块（留 25% 给活跃请求的 prefill/decode）
         self.max_cached_blocks = max(1, int(num_blocks * 0.75))
         self.prefix_hits = 0          # 完全命中请求数（统计用）
@@ -147,12 +151,14 @@ class KVCachePool:
             return None
         return blocks
 
-    def release_block(self, block_id: int, block_hash: int | None = None):
+    def release_block(self, block_id: int, block_hash: int | None = None,
+                      parent_hash: int = 0):
         """请求释放块：ref--，归零后按规则处理
 
         - 有哈希（完整 prompt 块）→ 恢复/登记为缓存块（保留 K/V，LRU 可淘汰）
         - 无哈希（decode 生产块 / 不完整块）→ 清零回空闲池
 
+        parent_hash 用于维护哈希链（链感知淘汰：优先淘汰链尾）。
         注意命中复用的情况：块一直在 `_prefix_index` 里（内容有效），
         match 时只是从 LRU 队列移出；释放时 ref 归零 → 放回 LRU 即可。
         """
@@ -165,12 +171,15 @@ class KVCachePool:
                 # 请求自己 prefill 出的新块：登记为缓存
                 self._prefix_index[block_hash] = block_id
                 self._block_hashes[block_id] = block_hash
+                self._block_parents[block_id] = parent_hash
+                self._children.setdefault(parent_hash, set()).add(block_hash)
                 self._cached_lru[block_id] = None
                 self._evict_cache()
                 return
             if existing == block_id:
                 # 原本就是缓存块（被命中复用）：恢复 LRU 待用
                 self._block_hashes[block_id] = block_hash
+                self._block_parents[block_id] = parent_hash
                 self._cached_lru[block_id] = None
                 self._evict_cache()
                 return
@@ -198,18 +207,45 @@ class KVCachePool:
         while self._cached_lru:
             blk, _ = self._cached_lru.popitem(last=False)
             h = self._block_hashes.pop(blk, None)
-            if h is not None and self._prefix_index.get(h) == blk:
-                del self._prefix_index[h]
+            parent = self._block_parents.pop(blk, 0)
+            if h is not None:
+                if self._prefix_index.get(h) == blk:
+                    del self._prefix_index[h]
+                kids = self._children.get(parent)
+                if kids is not None:
+                    kids.discard(h)
+                    if not kids:
+                        del self._children[parent]
             self._clear_and_free(blk)
 
     def _evict_cache(self):
-        """LRU 淘汰超出上限的缓存块（清零后回空闲池）"""
+        """淘汰超出上限的缓存块（清零后回空闲池）
+
+        链感知：优先淘汰"叶节点"（没有子块在缓存中的块），
+        避免淘汰链头后剩余块无法从 prompt 开头匹配（命中率骤降）。
+        若全部块都有子块（整条链都在缓存里），退回 LRU 最旧。
+        """
         while len(self._cached_lru) > self.max_cached_blocks:
-            blk, _ = self._cached_lru.popitem(last=False)
-            h = self._block_hashes.pop(blk, None)
-            if h is not None and self._prefix_index.get(h) == blk:
-                del self._prefix_index[h]
-            self._clear_and_free(blk)
+            victim = None
+            for blk in self._cached_lru:
+                h = self._block_hashes.get(blk)
+                if h is not None and not self._children.get(h):
+                    victim = blk
+                    break
+            if victim is None:
+                victim = next(iter(self._cached_lru))
+            self._cached_lru.pop(victim, None)
+            h = self._block_hashes.pop(victim, None)
+            parent = self._block_parents.pop(victim, 0)
+            if h is not None:
+                if self._prefix_index.get(h) == victim:
+                    del self._prefix_index[h]
+                kids = self._children.get(parent)
+                if kids is not None:
+                    kids.discard(h)
+                    if not kids:
+                        del self._children[parent]
+            self._clear_and_free(victim)
 
     # ---- 常驻 2D 块表：行槽位管理 ----
 
@@ -390,7 +426,9 @@ class PagedKVCache:
         if self.block_table:
             for i, blk in enumerate(self.block_table):
                 h = self.block_hashes[i] if i < len(self.block_hashes) else None
-                self._pool.release_block(blk, h)
+                parent = (self.block_hashes[i - 1]
+                          if i > 0 and i - 1 < len(self.block_hashes) else 0)
+                self._pool.release_block(blk, h, parent or 0)
             self.block_table = []
             self.block_hashes = []
             self.num_pages = 0      # GPU 张量内容无需清零（只读前 num_pages 项）

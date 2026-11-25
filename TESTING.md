@@ -50,6 +50,8 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 | `tests/unit/test_prefix_cache.py` | 块哈希链、完全/部分命中、COW、后缀组装、引用计数、LRU、池闭环 | 9 |
 | `tests/model/test_prefix_prefill.py` | 部分命中 vs 全量 prefill logits（CPU fp32） | 4 |
 | `tests/kernels/test_flash_prefill.py` | flash 普通 varlen / 历史路径（q/kv 长度分离） | 2 |
+| `tests/unit/test_chunked_prefill.py` | 长 prompt 切片、chunk 与 decode 交替、状态机、池闭环 | 4 |
+| `tests/model/test_chunked_prefill_equiv.py` | 分块 prefill logits == 整段（CPU fp32） | 2 |
 | `tests/kernels/test_update_kv_stride.py` | **v3.2 fused-qkv stride bug 回归**：连续/非连续切片、跨页写入 | 3 |
 | `tests/model/test_graph_equivalence.py` | CUDA Graph 图池 vs eager 逐 step logits 一致（bucket 1/2、空槽、池闭环） | 2 |
 | `tests/e2e/test_server_stream.py` | 真实 server SSE：流式==非流式、chunk 格式/usage、断开取消 | 3 |

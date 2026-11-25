@@ -30,11 +30,12 @@
 ### 工程流水线（P0，收益最大）
 
 ### 调度层（P1-P2）
-- [ ] chunked prefill：长 prompt 切片与 decode 混批
+- [x] chunked prefill：长 prompt 切片（prefill/decode 交替，短请求 TTFT 2.7x）
 - [ ] 优先级调度 + 抢占（短请求优先 / 长请求让步）
 - [ ] 精确内存账本 + watermark 水位管理
 - [x] prefix caching 阶段 1：块哈希链 + ref/LRU + 完全命中快速路径（TTFT 8.24x）
 - [x] prefix caching 阶段 2：部分命中（后缀 prefill + attention 读历史 KV，TTFT 1.3-1.6x @2k）
+- [x] prefix caching 阶段 3：链感知 LRU（优先淘汰链尾，避免前缀链被切断）
 
 ### Kernel 层（P2-P3）
 - [ ] split-K decode kernel（页并行，长上下文 SM 利用率）
@@ -84,7 +85,7 @@ prefill 融合 + decode 工程优化（v2.1/v2.2）+ CUDA Graph 图池（v3.0）
 | 能力 | 当前实现 | vLLM / 工业级 | 影响 |
 |---|---|---|---|
 | 调度策略 | 贪心 + FIFO | 优先级队列（公平/吞吐可配）+ 抢占 | 长请求可拖死短请求（无抢占） |
-| 混批 | ❌ prefill 与 decode 不同批 | ✅ chunked prefill：长 prompt 切片与 decode 混批 | 长 prefill 会卡住整个批 |
+| 混批 | ✅ chunked prefill（切片 + 交替；未同批混算） | ✅ chunked prefill：切片与 decode 同批混合 | 交替版 decode 仍有 chunk 步开销 |
 | 内存账本 | 只检查 prefill 块数 | 精确的 seq→块映射 + watermark 水位 | 极端负载可能 OOM |
 | 前缀复用 | ✅ 完全 + 部分命中（块哈希 + ref/LRU + 后缀 prefill） | ✅ prefix caching：任意前缀块共享 | 长历史收益显著，短历史自动回退 |
 | 换出 (swap) | ❌ | ✅ GPU↔CPU KV 块换出 | 无法超卖显存 |
@@ -238,7 +239,7 @@ decode 每步读一遍全部权重 → 理论下限 ≈ 0.75 ms/步（单请求�
 | P1 | `/metrics` 可观测性 | Prometheus 指标（含 TTFT） | 低 | [x] |
 | P1 | 权重 INT8 量化 | 带宽需求减半（0.75 → 0.4ms 下限） | 高 | [ ] |
 | P2 | split-K decode kernel | 长上下文 decode 提速 | 中 | [ ] |
-| P2 | chunked prefill 混批 | 长 prompt 不卡批 | 高 | [ ] |
+| P2 | chunked prefill | 长 prompt 切片，短请求 TTFT 2.7x | 高 | [x] |
 | P2 | 优先级调度 + 抢占 | 短请求不饿死 | 中 | [ ] |
 | P2 | TP 张量并行 | 权重分卡带宽×N；B=1 通信占比高，大 batch 收益大 | 高 | [ ] |
 | P3 | fp8 KV cache | 带宽减半 | 中 | [ ] |
