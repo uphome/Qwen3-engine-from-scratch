@@ -20,7 +20,7 @@
 ```
 块表（数据结构）                     状态机（生命周期）
 ──────────────────────────────      ────────────────────────────────
-逻辑页 → 物理块                      物理块：free / active / cached
+逻辑页 → 物理块                      物理块：free / owned / shared / cached
 PagedKVCache.block_table            请求：waiting → prefilling → decoding → finished
 block_table_2d[row_id]              （Request 状态机，见 LEARN_03）
 ```
@@ -49,7 +49,7 @@ class PagedKVCache:
 读完你应该能回答：
 
 1. 为什么只有块表不够，还需要引用计数和缓存状态？
-2. `free / active / cached` 三态之间怎么迁移？谁会触发？
+2. 运行时四态（FREE / OWNED / SHARED / CACHED）之间怎么迁移？谁会触发？
 3. `block_refs`、`_prefix_index`、`_cached_lru`、`_block_hashes` 各自解决什么问题？
 4. 完全命中时 COW 在状态机上具体发生了什么？
 5. 为什么容量淘汰不会误伤正在 decode 的请求？
@@ -145,18 +145,35 @@ self._free_rows = list(range(max_requests))
 
 ---
 
-## 3. 核心模型：2×2 状态表
+## 3. 核心模型：运行时四态（2×2）
 
-把“引用计数”和“是否进入池级哈希索引”当成两个正交维度，状态会非常清晰：
+把“引用计数”和“是否进入池级哈希索引”当成两个正交维度，会得到四个运行时状态：
 
 | | 未进 `_prefix_index` | 已进 `_prefix_index` |
 |---|---|---|
-| **ref = 0** | **FREE**（在 `free_block_ids`） | **CACHED**（在 `_cached_lru`） |
-| **ref > 0** | **ACTIVE（新生产块）** | **ACTIVE（命中/共享块）** |
+| **ref = 0** | **① FREE（空闲）** | **④ CACHED（缓存保留）** |
+| **ref > 0** | **② OWNED（私有活跃）** | **③ SHARED（共享活跃）** |
+
+为什么可以说“三态”也可以说“四态”：
+
+- 从**分配/淘汰**角度看，② OWNED 和 ③ SHARED 都是 `ref>0`，都不能被
+  `alloc` 拿到、也不能被淘汰，所以常被合并成一个 `active`；
+- 从**前缀缓存**角度看，② 和 ③ 的能力不同：② 只属于生产它的请求，
+  不能被其他请求命中；③ 已登记池级哈希，可以被继续匹配、`ref` 可以 >1。
+- 注意：**不要用“是否正在使用”来区分 ② 和 ③**——两者都有活跃请求在用。
+  真正的区别是“是否可共享/可命中”。
+
+> 下文的“状态机”以四态为准；其他文档里的 `active` 是 ②+③ 的简写。
+
+> 补充：你提到的“新产生”和“正在被使用”在代码里都属于 `ref>0`，
+> 并不是一个稳定的二分——新产生的块也在被它的属主请求使用。
+> 代码真正区分的是“是否已登记池级索引”。如果把“已 alloc 但还没写 K/V”
+> 也算一态，那只是 `update()` / `reserve_next()` 内部的瞬态，
+> 不会在调度步之间停留。
 
 逐格解释：
 
-### 3.1 FREE
+### 3.1 ① FREE（空闲）
 
 ```python
 ref = 0
@@ -182,22 +199,34 @@ def alloc(self, n):
     return allocated
 ```
 
-### 3.2 ACTIVE（新生产块）
+### 3.2 ② OWNED（私有活跃）
 
 ```python
 ref > 0
+不在 _prefix_index
 不在 _cached_lru
-通常也不在 _prefix_index
 ```
 
-请求 prefill/decode 自己写出来的块。它可能已经在请求句柄的
-`block_hashes` 里记了哈希（完整 prompt 块），但**还没登记进池级索引**——
-登记发生在请求结束、块被释放时。所以这类块在活跃期间不能被其他请求命中。
+请求 prefill/decode 自己写出来的块。它在**整个请求生命周期内都是 OWNED**，
+不只是“刚分配的那一刻”：
+
+- decode 生产块没有哈希，会一直 OWNED 到释放；
+- 完整 prompt 块虽然在请求句柄的 `block_hashes` 里记了哈希，但**池级索引登记
+  发生在请求结束、块被释放时**，所以活跃期间仍然是 OWNED；
+- 它只属于生产它的请求，其他请求无法命中。
+
+释放时：
+
+```
+OWNED --release(hash)──────────► CACHED（新登记）
+OWNED --release(hash=None)─────► FREE
+OWNED --release(重复哈希)──────► FREE
+```
 
 > 这也解释了一个常见疑问：“为什么 A 还在跑，B 不能直接命中 A 刚 prefill 的块？”
 > 因为池级索引登记在 `release_block()`，而不是 prefill 完成时。
 
-### 3.3 ACTIVE（命中/共享块）
+### 3.3 ③ SHARED（共享活跃）
 
 ```python
 ref > 0
@@ -216,9 +245,10 @@ self._cached_lru.pop(blk, None)     # 使用期间不可淘汰
 
 - 块对后来的请求仍然可见，`ref` 可以继续增长到 2、3……
 - 但它已经不在 LRU，淘汰逻辑不会碰它；
+- 多个请求可以同时持有它（共享只读前缀）；
 - 最后一个请求释放、`ref` 归零后，它再回到 CACHED。
 
-### 3.4 CACHED
+### 3.4 ④ CACHED（缓存保留）
 
 ```python
 ref = 0
@@ -228,33 +258,43 @@ ref = 0
 K/V 内容保留
 ```
 
-这是“可复用但可回收”的状态。两个触发会离开它：
+这是“没有人使用，但存着以备下一次复用”的状态。两个触发会离开它：
 
-- `match_prefix_partial()`：CACHED → ACTIVE（ref++，出 LRU）
+- `match_prefix_partial()`：CACHED → SHARED（ref++，出 LRU）
 - `_evict_one()` / `clear_prefix_cache()`：CACHED → FREE（清 KV，回池）
 
-### 3.5 一张图记住迁移
+### 3.5 四态迁移图
 
 ```
                         alloc(n)
         ┌────────┐ ─────────────────► ┌──────────────────────┐
-        │  FREE  │                    │  ACTIVE（新生产块）    │
-        │ ref=0  │ ◄───────────────── │  ref>0, 不在索引       │
-        └────────┘  release(hash=None)└──────────┬───────────┘
-             ▲                                  │
-             │                                  │ release(hash)
-             │                                  ▼
+        │  FREE  │                    │  OWNED（私有活跃）    │
+        │  ref=0 │ ◄───────────────── │  ref>0, 不在索引       │
+        └────────┘ release(hash=None) └──────────┬───────────┘
+             ▲           / 重复哈希                │
+             │                                     │ release(hash)
+             │                                     ▼
              │                       ┌──────────────────────┐
-             │      evict / clear    │  CACHED（缓存块）      │
+             │      evict / clear    │  CACHED（缓存保留）    │
              └────────────────────── │  ref=0, 在索引 + LRU  │
                                      └──────────┬───────────┘
                                                 │ match：ref++，出 LRU
                                                 ▼
                                      ┌──────────────────────┐
-                                     │ ACTIVE（命中/共享块）  │
-                                     │ ref>0, 仍在索引        │
+                                     │  SHARED（共享活跃）    │
+                                     │  ref>0, 仍在索引       │
                                      └──────────────────────┘
+                                          │      ▲
+                                          └──────┘
+                                  release 后 ref 仍 >0（自迁移）
 ```
+
+两条容易写错的规则：
+
+1. **没有 OWNED → SHARED 的直接迁移**。新块必须先 `release(hash)` 变成
+   CACHED（ref=0），之后才可能被 `match` 成 SHARED。
+2. **SHARED 不会变回 OWNED**。它要么在 ref>0 时保持 SHARED（自迁移），
+   要么在最后一个引用释放后变 CACHED。
 
 ---
 
@@ -262,16 +302,17 @@ K/V 内容保留
 
 | # | 迁移 | 触发点 | 代码 | 关键动作 |
 |---|---|---|---|---|
-| 1 | FREE → ACTIVE | 请求需要新页 | `KVCachePool.alloc()` | 从 free 表尾取块、清零 K/V、`ref=1` |
-| 2 | CACHED → ACTIVE | 前缀命中 | `match_prefix_partial()` | `ref++`、从 `_cached_lru` 移除 |
-| 3 | ACTIVE → ACTIVE | 共享块被另一个请求释放 | `release_block()` 开头 | `ref--`，块仍在索引，不可淘汰 |
-| 4 | ACTIVE → CACHED | 最后一个引用释放，且 `hash != None` 且没有重复哈希 | `release_block()` | 登记索引/进 LRU（恢复路径不改父链） |
-| 5 | ACTIVE → FREE | 最后一个引用释放，且 `hash == None` | `release_block()` → `_clear_and_free()` | 清 K/V、`ref=0`、回 free 表 |
-| 6 | ACTIVE → FREE | 最后一个引用释放，但同哈希已有另一个缓存块 | `release_block()` 的重复分支 | 当前块内容作废，直接回收 |
-| 7 | CACHED → FREE | 缓存超上限（释放路径） | `_evict_cache()` → `_evict_one()` | 链感知淘汰、清 KV、回池 |
-| 8 | CACHED → FREE | 容量压力（分配路径） | `evict_cache_for()` → `_evict_one()` | 只淘汰 ref=0、只淘汰到够用、计数 |
-| 9 | CACHED → FREE | 手动清空/基准重置 | `clear_prefix_cache()` | 全部缓存回池 |
-| 10 | 任意 → FREE | 直接归还（测试/哑行） | `KVCachePool.free(block_ids)` | 绕过前缀缓存登记，直接清索引 |
+| 1 | FREE → OWNED | 请求需要新页 | `KVCachePool.alloc()` | 从 free 表尾取块、清零 K/V、`ref=1` |
+| 2 | CACHED → SHARED | 前缀命中 | `match_prefix_partial()` | `ref++`、从 `_cached_lru` 移除，保留索引 |
+| 3 | SHARED → SHARED | 共享块被另一个请求释放，仍有读者 | `release_block()` 开头 | `ref--`，块仍在索引，不可淘汰 |
+| 4 | OWNED → CACHED | 新生产块释放，`hash != None`，且同哈希无其他块 | `release_block()` 分支 ① | 登记哈希/父链、进 LRU |
+| 5 | SHARED → CACHED | 命中复用的块最后一个引用释放 | `release_block()` 分支 ② | 只恢复 LRU（不改哈希/父链） |
+| 6 | OWNED → FREE | 最后一个引用释放，且 `hash == None` | `release_block()` → `_clear_and_free()` | 清 K/V、`ref=0`、回 free 表 |
+| 7 | OWNED → FREE | 最后一个引用释放，但同哈希已有另一个缓存块 | `release_block()` 分支 ③ | 当前块内容作废，直接回收 |
+| 8 | CACHED → FREE | 缓存超上限（释放路径） | `_evict_cache()` → `_evict_one()` | 链感知淘汰、清 KV、回池 |
+| 9 | CACHED → FREE | 容量压力（分配路径） | `evict_cache_for()` → `_evict_one()` | 只淘汰 ref=0、只淘汰到够用、计数 |
+| 10 | CACHED → FREE | 手动清空/基准重置 | `clear_prefix_cache()` | 全部缓存回池 |
+| 11 | 任意 → FREE | 直接归还（测试/哑行） | `KVCachePool.free(block_ids)` | 绕过前缀缓存登记，直接清索引 |
 
 > 表中的 “hash” 指池级哈希；请求句柄里的 `block_hashes` 只是“释放时交给池的凭据”。
 
@@ -283,7 +324,7 @@ K/V 内容保留
 def release_block(self, block_id, block_hash=None, parent_hash=0):
     self._release_ref(block_id)
     if self.block_refs[block_id] > 0:
-        return                              # 还有别的请求在用：ACTIVE 自迁移
+        return                              # 还有别的请求在用：SHARED 自迁移
 
     if block_hash is not None:
         existing = self._prefix_index.get(block_hash)
@@ -312,9 +353,9 @@ def release_block(self, block_id, block_hash=None, parent_hash=0):
 
 | 分支 | 场景 | 结果 |
 |---|---|---|
-| ① `existing is None` | 请求自己 prefill 出的完整 prompt 块 | ACTIVE → CACHED（新登记） |
-| ② `existing == block_id` | 命中复用的缓存块，ref 归零 | ACTIVE → CACHED（只恢复 LRU） |
-| ③ `existing 是别的块` | 重复哈希 | ACTIVE → FREE（内容作废） |
+| ① `existing is None` | 请求自己 prefill 出的完整 prompt 块 | OWNED → CACHED（新登记） |
+| ② `existing == block_id` | 命中复用的缓存块，ref 归零 | SHARED → CACHED（只恢复 LRU） |
+| ③ `existing 是别的块` | 重复哈希 | OWNED → FREE（内容作废） |
 
 **分支 ② 是踩过坑的**：命中复用的块一直在 `_prefix_index` 里，
 如果把它当成“重复块”清理，缓存会瞬间失效（命中率归 0）。正确做法是
@@ -359,7 +400,7 @@ cached      = 0
 `PagedKVCache.update()` 根据 `end_pos = 40` 计算需要 3 页：
 
 ```
-FREE → ACTIVE（b0, b1, b2）
+FREE → OWNED（b0, b1, b2）
 block_table = [b0, b1, b2]
 block_refs  = b0=1, b1=1, b2=1
 free_count  = 29
@@ -379,7 +420,7 @@ cache.block_hashes = [h0, h1, None]
 prompt 40 + 已生成 8 = 48，正好用满 3 块；再生成第 49 个 token 时需要第 4 页：
 
 ```
-reserve_next() → FREE → ACTIVE（b3）
+reserve_next() → FREE → OWNED（b3）
 block_table = [b0, b1, b2, b3]
 free_count  = 28
 ```
@@ -399,10 +440,10 @@ for i, blk in enumerate(self.block_table):
 
 | 块 | 内容 | hash | 迁移 | 说明 |
 |---|---|---|---|---|
-| b0 | prompt[0:16] | h0 | ACTIVE → CACHED | 完整 prompt 块，可复用 |
-| b1 | prompt[16:32] | h1 | ACTIVE → CACHED | 完整 prompt 块，可复用 |
-| b2 | prompt[32:40] + gen[0:8] | None | ACTIVE → FREE | 内容混合，不能缓存 |
-| b3 | gen[8:16] | None | ACTIVE → FREE | decode 块，直接回收 |
+| b0 | prompt[0:16] | h0 | OWNED → CACHED | 完整 prompt 块，可复用 |
+| b1 | prompt[16:32] | h1 | OWNED → CACHED | 完整 prompt 块，可复用 |
+| b2 | prompt[32:40] + gen[0:8] | None | OWNED → FREE | 内容混合，不能缓存 |
+| b3 | gen[8:16] | None | OWNED → FREE | decode 块，直接回收 |
 
 最终：
 
@@ -425,14 +466,14 @@ free + cached = 32 = total_blocks
 
 ```
 1. match_prefix_partial([h0, h1])
-   → b0, b1: CACHED → ACTIVE，ref 各 +1，移出 LRU
+   → b0, b1: CACHED → SHARED，ref 各 +1，移出 LRU
    → 但仍在 _prefix_index 中
 
 2. COW 最后一个块：
-   → alloc(1) 得到 privB：FREE → ACTIVE（ref=1）
+   → alloc(1) 得到 privB：FREE → OWNED（ref=1）
    → copy_block(b1, privB)
    → release_block(b1, h1)：ref 1→0，existing == b1
-       → ACTIVE → CACHED（放回 LRU）
+       → SHARED → CACHED（放回 LRU）
    → bind_prefix([b0, privB], [h0, None])
 ```
 
@@ -448,7 +489,7 @@ B.block_table = [b0, privB]
 ```
 match_prefix_partial([h0, h1])
   → b0: ref 1→2（共享！）
-  → b1: ref 0→1（CACHED → ACTIVE）
+  → b1: ref 0→1（CACHED → SHARED）
   → COW b1 → privC
   → release b1：ref 1→0 → CACHED
 C.block_table = [b0, privC]
@@ -485,16 +526,16 @@ C.finish():
 
 ```
 match_prefix_partial([h0, h1])
-  → b0、b1：CACHED → ACTIVE（ref++，移出 LRU）
+  → b0、b1：CACHED → SHARED（ref++，移出 LRU）
   → bind_prefix([b0, b1], [h0, h1])
   → seq_len = 32，prefill_offset = 32
 
 prefill 后缀 4 token
   → 需要 ceil(36/16)=3 页，已有 2 页
-  → alloc 第 3 页 b2：FREE → ACTIVE（新生产块）
+  → alloc 第 3 页 b2：FREE → OWNED（私有活跃）
 
 结束
-  → b0、b1：release(hash) → ACTIVE → CACHED
+  → b0、b1：release(hash) → SHARED → CACHED
   → b2：不是完整 prompt 块（36 = 2×16 + 4），hash=None → FREE
 ```
 
@@ -518,10 +559,10 @@ prefill 后缀 4 token
 ```
 状态序列：
   b_last: CACHED
-    ── match ──► ACTIVE (ref=1, 出 LRU)
-    ── alloc priv ──► priv: FREE → ACTIVE (ref=1)
+    ── match ──► SHARED (ref=1, 出 LRU)
+    ── alloc priv ──► priv: FREE → OWNED (ref=1)
     ── copy_block(b_last, priv) ──► K/V 复制
-    ── release_block(b_last, h) ──► b_last: ACTIVE → CACHED (ref=0, 回 LRU)
+    ── release_block(b_last, h) ──► b_last: SHARED → CACHED (ref=0, 回 LRU)
     ── bind_prefix([...b_last 之外的块..., priv]) ──► 请求持有 priv
 ```
 
@@ -613,7 +654,7 @@ def evict_cache_for(self, need):
 
 关键性质：
 
-1. **只淘汰 CACHED（ref=0）**，绝不碰 ACTIVE；
+1. **只淘汰 CACHED（ref=0）**，绝不碰 ref>0 的 OWNED / SHARED 块；
 2. **只淘汰到够用为止**，不会为一个请求清空整个缓存；
 3. **顺序是“先匹配、后淘汰”**：`Scheduler.add` 先 `match_prefix_partial`
    （命中块 ref++ 并移出 LRU），再 `_ensure_capacity`。所以当前请求的命中块
@@ -644,7 +685,7 @@ self._free_rows = list(range(max_requests))
 生命周期：
 
 ```
-FREE ROW ──alloc_row()──► ACTIVE ROW ──free_row()──► FREE ROW
+FREE ROW ──alloc_row()──► ALLOCATED ROW ──free_row()──► FREE ROW
 （_free_rows 中）          （PagedKVCache.row_id）     （回到 _free_rows）
 ```
 
@@ -672,7 +713,7 @@ FREE ROW ──alloc_row()──► ACTIVE ROW ──free_row()──► FREE RO
 ```python
 except Exception:
     for b, h in zip(matched, hashes):
-        self.pool.release_block(b, h)       # ACTIVE → CACHED（ref 归零）
+        self.pool.release_block(b, h)       # SHARED → CACHED（ref 归零）
     if req.kv_cache is not None and not req.kv_cache.block_table:
         req.kv_cache.free()                 # 归还 row 槽位
     raise
@@ -719,7 +760,7 @@ def free(self, block_ids):
 
 | # | 不变量 |
 |---|---|
-| I1 | 每个物理块恰好属于 FREE / CACHED / ACTIVE 之一（唯一归属） |
+| I1 | 每个物理块恰好属于 FREE / OWNED / SHARED / CACHED 之一（唯一归属） |
 | I2 | FREE 块：`ref=0`、不在 `_prefix_index`、不在 `_cached_lru` |
 | I3 | `_cached_lru` 中的块一定 `ref=0`，且一定在 `_prefix_index` |
 | I4 | `_prefix_index[h] = b` ⇒ `_block_hashes[b] = h`；父链关系一致 |
@@ -736,28 +777,33 @@ def free(self, block_ids):
 def check_pool(pool):
     free = set(pool.free_block_ids)
     cached = set(pool._cached_lru)
+    indexed = set(pool._prefix_index.values())
     active = {i for i, r in enumerate(pool.block_refs) if r > 0}
+    owned = active - indexed          # ② ref>0，未登记索引
+    shared = active & indexed         # ③ ref>0，已登记索引
 
     assert len(pool.free_block_ids) == len(free), "free 表有重复块"
-    assert free.isdisjoint(cached), "块同时是 free 和 cached"
-    assert free.isdisjoint(active), "块同时是 free 和 active"
-    assert cached.isdisjoint(active), "块同时是 cached 和 active"
-    assert free | cached | active == set(range(pool.total_blocks))
+    assert free.isdisjoint(cached | owned | shared), "free 与其他状态重叠"
+    assert cached.isdisjoint(owned | shared), "cached 与活跃状态重叠"
+    assert owned.isdisjoint(shared), "块不能同时是 owned 和 shared"
+    assert free | owned | shared | cached == set(range(pool.total_blocks))
 
     assert all(pool.block_refs[b] == 0 for b in free | cached)
-    assert cached <= set(pool._prefix_index.values())
+    assert all(pool.block_refs[b] > 0 for b in owned | shared)
+    assert cached <= indexed
+    assert indexed <= cached | shared       # 索引里的块要么缓存，要么共享活跃
     for h, b in pool._prefix_index.items():
         assert pool._block_hashes[b] == h
 ```
 
 > 注意 `cached <= set(_prefix_index.values())` 而不是相等：
-> `_prefix_index` 里还可能有被命中的 ACTIVE 块（ref>0）。
+> `_prefix_index` 里还可能有被命中的 SHARED 块（ref>0）。
 
 ---
 
 ## 12. 动手实验
 
-### 12.1 直接观察三态
+### 12.1 直接观察四态
 
 ```python
 import torch
@@ -787,9 +833,14 @@ print("refs:", pool.block_refs)
 # 再命中
 c2 = PagedKVCache(pool)
 matched = pool.match_prefix_partial(compute_prefix_hashes(ids, 16))
+indexed = set(pool._prefix_index.values())
 print("matched:", matched)
 print("refs:", [pool.block_refs[b] for b in matched])
 print("cached:", pool.cached_count)                    # 0（都移出 LRU）
+print("owned:", [i for i, r in enumerate(pool.block_refs)
+                 if r > 0 and i not in indexed])       # 空
+print("shared:", [i for i, r in enumerate(pool.block_refs)
+                  if r > 0 and i in indexed])          # matched 的两个块
 ```
 
 预期：命中后 `matched` 的两个块 `ref=1`，`cached_count` 变 0，
@@ -842,8 +893,8 @@ pytest tests/unit/test_cache_eviction.py::test_evict_disabled_raises -q
    淘汰时只有块 ID，需要反查哈希才能删 `_prefix_index`、维护父链。
 
 5. **完全命中时 COW 的每一步状态是什么？**
-   CACHED → match → ACTIVE → alloc priv → copy → release 原块 → CACHED；
-   priv 是 ACTIVE（未索引），之后 decode 写 priv。
+   CACHED → match → SHARED → alloc priv（FREE → OWNED）→ copy →
+   release 原块（SHARED → CACHED）；priv 保持 OWNED，之后 decode 写 priv。
 
 6. **容量压力淘汰为什么不会误伤当前请求？**
    `Scheduler.add` 先匹配（命中块 ref++、移出 LRU），后淘汰；淘汰只碰
@@ -863,6 +914,12 @@ pytest tests/unit/test_cache_eviction.py::test_evict_disabled_raises -q
 10. **缓存块会不会被下一个请求写坏？**
     不会。共享块只读；唯一可能被写的最后一块在完全命中时 COW 成私有副本，
     部分命中时新 token 写入新分配的块。
+
+11. **为什么 OWNED 和 SHARED 不合并成一个 active？**
+    从分配/淘汰看可以合并（两者都 `ref>0`、都不可淘汰），这就是“三态”视角；
+    但从前缀缓存看，OWNED 还没进池级索引、不能被其他请求命中，SHARED 已经
+    登记哈希、可以被继续匹配。四态把“是否可共享”显式表达出来，调试命中率
+    和 ref 计数时不会混淆。
 
 ---
 
@@ -891,5 +948,6 @@ pytest tests/unit/test_cache_eviction.py::test_evict_disabled_raises -q
 > **块表负责“地址”，引用计数负责“读者”，缓存索引负责“内容复用”，
 > 状态机负责“什么时候允许谁动它”。**
 >
-> `free → active → cached → free` 的每一次迁移都必须满足：
-> 活跃块不可淘汰、缓存块可命中但不可写、空闲块不含有效内容。
+> 运行时有四态：`FREE`（空闲）→ `OWNED`（私有活跃）→ `CACHED`（缓存保留）
+> ↔ `SHARED`（共享活跃）。每一次迁移都必须满足：
+> 活跃块（OWNED/SHARED）不可淘汰、缓存块可命中但不可写、空闲块不含有效内容。

@@ -9,7 +9,7 @@
 | 03 | [LEARN_03_SCHEDULING.md](LEARN_03_SCHEDULING.md) | 状态机、组批、chunked prefill、容量记账 | `qwen3/scheduler.py`、`request.py`、`batch.py` |
 | 04 | [LEARN_04_TESTING_BENCH.md](LEARN_04_TESTING_BENCH.md) | 四层测试、CI、TTFT/TPOT 口径、压测与长稳 | `tests/`、`bench_*.py`、`scripts/` |
 | 05 | [LEARN_05_TRAINING_MONITORING.md](LEARN_05_TRAINING_MONITORING.md) | 训推同机监控：快照接口、JSONL、GRPO 集成 | `qwen3/monitoring.py`、`integrations/` |
-| 06 | [LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md) | 块池三态、ref 计数、COW、淘汰、不变量 | `qwen3/PagedKVcache.py`、`scheduler.py` |
+| 06 | [LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md) | 块池四态、ref 计数、COW、淘汰、不变量 | `qwen3/PagedKVcache.py`、`scheduler.py` |
 
 每篇的结构：**概念 → 代码逐段 → 为什么这样设计 → 踩过的坑 → 动手实验 → 自测问题**。
 

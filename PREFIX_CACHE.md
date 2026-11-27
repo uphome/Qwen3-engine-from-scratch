@@ -37,25 +37,32 @@ h_2 = blake2b(parent=h_1,  tokens[32:48])
 
 实现：`qwen3/prefix_cache.py`（`hash_block` / `compute_prefix_hashes`）。
 
-### 2.2 块池：空闲 / 缓存 / 引用计数
+### 2.2 块池：运行时四态与引用计数
 
-`KVCachePool` 的物理块有三种状态：
+`KVCachePool` 的物理块在运行时有四种状态（分配/淘汰视角常把
+OWNED/SHARED 合并成 `active`）：
+
+| | 未进 `_prefix_index` | 已进 `_prefix_index` |
+|---|---|---|
+| **ref = 0** | **FREE**（空闲） | **CACHED**（缓存保留） |
+| **ref > 0** | **OWNED**（新生产，不可共享） | **SHARED**（命中，可共享） |
 
 ```
-free_block_ids          空闲块（内容已清零，可分配）
-_prefix_index            hash → 块（缓存块，保留 K/V 等待复用）
-_cached_lru              ref=0 的缓存块（LRU 淘汰候选）
-block_refs[blk]          引用计数（活跃请求持有 > 0）
+free_block_ids          FREE（空闲块，内容不可依赖，alloc 时清零）
+_prefix_index           hash → 块（CACHED 或 SHARED）
+_cached_lru             ref=0 的 CACHED 块（LRU 淘汰候选）
+block_refs[blk]         >0：OWNED（未索引）或 SHARED（已索引）
 ```
 
 关键规则：
 
 | 事件 | 行为 |
 |---|---|
-| `alloc(n)` | 只从 free 池取（**永远不会拿到缓存块**，天然避免误清零） |
-| 命中缓存 | `block_refs++`，块从 LRU 移出（使用期间不可淘汰） |
-| 请求释放块（有 hash） | `ref--`；归零后**放回 LRU 保留 K/V** |
-| 请求释放块（无 hash） | 清零回 free（decode 生产块） |
+| `alloc(n)` | 只从 FREE 取（**永远不会拿到缓存块**，天然避免误清零） |
+| 新生产块 | prefill/decode 写入 → OWNED；请求结束才可能登记为 CACHED |
+| 命中缓存 | CACHED → SHARED，`ref++`，块从 LRU 移出（使用期间不可淘汰） |
+| 请求释放块（有 hash） | `ref--`；仍 >0 保持 SHARED；归零后回 CACHED 保留 K/V |
+| 请求释放块（无 hash） | OWNED → FREE（清零回收） |
 | 缓存超上限 | **链感知 LRU**：优先淘汰叶节点（无子块），避免切断前缀链；全链在缓存时退回 LRU 最旧 |
 | 容量不足（活跃请求需要空间） | **强制淘汰 ref=0 缓存块**（链感知），再重试分配；`QWEN3_CACHE_EVICT_ON_DEMAND=0` 可关闭（退回直接拒绝） |
 

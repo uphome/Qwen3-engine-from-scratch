@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-11-27 — 文档：块池运行时四态模型
+
+- 把 `active` 拆成两个运行时状态：
+  `OWNED`（ref>0，未进 `_prefix_index`，不可共享）与
+  `SHARED`（ref>0，已进索引，可被其他请求命中/共享）
+- 四态为 `FREE / OWNED / SHARED / CACHED`；补充迁移规则：
+  没有 OWNED→SHARED 直达、SHARED 在 ref>0 时自迁移
+- `docs/LEARN_06` 的不变量/`check_pool`/实验改为四态；
+  LEARN_02、PREFIX_CACHE、docs 索引同步
+
+---
+
 ## 2026-11-27 — 修复 COW/回滚释放导致父链退化
 
 - `KVCachePool.release_block` 的 `existing == block_id` 分支不再用调用方

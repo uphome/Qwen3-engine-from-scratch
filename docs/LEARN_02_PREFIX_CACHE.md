@@ -4,7 +4,7 @@
 > （`Scheduler.add`）、`qwen3/batch.py`、`qwen3/model.py`、`qwen3/attention.py`、
 > `qwen3/paged_attention.py`、`tests/unit/test_prefix_cache.py`
 > 关联文档：[PREFIX_CACHE.md](../PREFIX_CACHE.md)（设计与实测）、
-> [LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md)（块池三态/COW/淘汰的逐状态讲解）
+> [LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md)（块池四态/COW/淘汰的逐状态讲解）
 
 ---
 
@@ -96,16 +96,23 @@ h2 = H(h1, tokens[32:48])
 
 ## 3. 块池状态机
 
-`KVCachePool`（`qwen3/PagedKVcache.py`）的物理块有三种状态：
+`KVCachePool`（`qwen3/PagedKVcache.py`）的物理块在运行时有四种状态
+（`active` 是后两者的简写）：
 
-```
-                 alloc(n)                    release_block(hash)
- free_block_ids ─────────►  active(ref>0) ───────────────────► cached(ref=0, 在 LRU)
-      ▲                        │                                    │
-      │                        │ release_block(hash=None)           │ _evict_cache / clear
-      │                        ▼                                    │
-      └──────────────────  _clear_and_free ◄────────────────────────┘
-```
+| | 未进 `_prefix_index` | 已进 `_prefix_index` |
+|---|---|---|
+| **ref = 0** | **FREE**（空闲） | **CACHED**（缓存保留） |
+| **ref > 0** | **OWNED**（新生产，未登记） | **SHARED**（命中，已登记） |
+
+- **OWNED**：prefill/decode 新写出的块；只有生产它的请求持有，
+  池级索引登记发生在请求结束 `release_block()` 时，所以活跃期间不能被其他请求命中。
+- **SHARED**：命中了缓存块的请求持有；哈希仍在索引里，`ref` 可以 >1，
+  多个请求共享只读前缀，且不可淘汰。
+- **CACHED**：没人使用但保留 K/V，等待下一次命中或被淘汰。
+- **FREE**：可分配。
+
+完整迁移（COW、父链、容量淘汰）见
+[LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md)。
 
 数据字段：
 
