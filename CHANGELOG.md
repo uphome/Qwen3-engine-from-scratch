@@ -5,6 +5,16 @@
 
 ---
 
+## 2026-11-27 — 文档：补充 LRU 顺序与淘汰语义
+
+- `docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md` §8.1.1：
+  `_cached_lru` 头旧尾新、match 移出、最后释放回尾；
+  淘汰是“最旧的可淘汰叶节点”，不是全局最旧；`clear_prefix_cache()` 例外
+- `docs/LEARN_02_PREFIX_CACHE.md` §3.5、`PREFIX_CACHE.md` §2.2/§6：
+  摘要与交叉链接同步
+
+---
+
 ## 2026-11-27 — 块池四态查询接口与注释对齐
 
 - 新增 `KVCachePool.block_state(block_id)`：只读派生

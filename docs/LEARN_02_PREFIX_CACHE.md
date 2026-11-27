@@ -222,6 +222,19 @@ def _evict_cache(self):
 效果：A→B→C 链 + 无关块 D、上限 3 → 淘汰 C（链尾），保留 A、B，
 前缀仍能命中 2 块（见 `test_chain_aware_eviction_keeps_prefix_chain`）。
 
+### 3.5 LRU 顺序怎么维护
+
+`_cached_lru` 是 `OrderedDict`：**头部最旧，尾部最新**。
+
+- 请求结束、块登记为 CACHED → 追加到尾部；
+- `match_prefix_partial()` 命中 → 从 LRU 移出（`ref>0`，使用期间不可淘汰）；
+- 最后一个引用释放、`ref` 归零 → 重新追加到尾部；
+- `_evict_one()` 从旧到新扫描，选第一个叶节点；没有叶节点才退回全局最旧。
+
+所以“最久没有被使用”记录的是**块最后一次回到缓存的顺序**，不是每次读
+K/V 的时间戳；活跃块不在 LRU 里，天然不会被淘汰。完整示例与边界见
+[LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md) §8.1.1。
+
 ---
 
 ## 4. 完全命中（阶段 1）

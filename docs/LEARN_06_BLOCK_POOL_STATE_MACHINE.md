@@ -627,6 +627,56 @@ self._children[parent_hash].add(block_hash)
 self._block_parents[block_id] = parent_hash
 ```
 
+### 8.1.1 “最久没有被使用”是怎么确定的
+
+这里没有时间戳，也没有访问计数器；LRU 顺序完全由 `_cached_lru` 这个
+`OrderedDict` 的插入顺序表示：**头部最旧，尾部最新**。
+
+| 操作 | `_cached_lru` 变化 | 含义 |
+|---|---|---|
+| 请求结束，块登记为 CACHED | `_cached_lru[blk] = None` | 追加到尾部（最新） |
+| `match_prefix_partial()` 命中 | `_cached_lru.pop(blk, None)` | 移出 LRU，使用期间不可淘汰 |
+| 最后一个引用释放（ref 归零） | `_cached_lru[blk] = None` | 重新追加到尾部（最新） |
+| `_evict_one()` 淘汰 | `_cached_lru.pop(victim)` | 从头部附近删除 |
+
+所以“最久没有被使用”在代码里的准确含义是：
+
+> **最久没有被登记/释放回缓存的块。**
+
+它记录的不是“最后一次读 K/V 的时间戳”，而是“最后一次回到缓存的顺序”。
+原因很简单：
+
+- 块被命中时处于 `SHARED`（ref>0），已经不在 LRU 里，根本不会被淘汰；
+- 只有最后一个引用释放、块回到 `CACHED` 时，才重新进入 LRU 尾部；
+- 因此活跃期间不需要每次读都刷新 LRU，释放时刷新一次就够了。
+
+`_evict_one()` 并不是直接取全局最旧块，而是从旧到新扫描，选**第一个叶节点**：
+
+```python
+for blk in self._cached_lru:              # 旧 → 新
+    h = self._block_hashes.get(blk)
+    if h is not None and not self._children.get(h):
+        victim = blk                      # 最旧的“可淘汰叶节点”
+        break
+```
+
+因此更精确的说法是：
+
+> **淘汰 LRU 顺序中最久没有被使用、且没有子块的叶节点。**
+
+上面的 A → B → C 例子就是：A 虽然最旧，但它是内部节点，淘汰它会留下
+无法从链头命中的 B/C；所以先淘汰叶节点 C。
+
+只有整条链都在缓存、找不到叶节点时，才退回全局最旧：
+
+```python
+if victim is None:
+    victim = next(iter(self._cached_lru))
+```
+
+手动清空 `clear_prefix_cache()` 是例外：它从 `_cached_lru` 头部开始
+`popitem(last=False)`，把缓存全部清掉，不再考虑叶节点（基准重置用）。
+
 ### 8.2 容量压力：`evict_cache_for`
 
 当活跃请求需要新块、但 free 不够时，`Scheduler._ensure_capacity` 会：

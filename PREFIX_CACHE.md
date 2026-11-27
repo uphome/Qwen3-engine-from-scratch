@@ -68,6 +68,10 @@ block_refs[blk]         >0：OWNED（未索引）或 SHARED（已索引）
 
 缓存上限：`max_cached_blocks = 75% × num_blocks`（留 25% 给活跃请求）。
 
+LRU 顺序：`_cached_lru` 是 `OrderedDict`（头旧尾新）；登记/最后释放追加尾部，
+命中时移出。淘汰从旧到新找第一个叶节点，不是全局最旧。完整解释见
+[docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md](docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md) §8.1.1。
+
 ### 2.3 完全命中（阶段 1）
 
 条件：**prompt 长度块对齐**且所有完整块哈希全部命中。
@@ -211,6 +215,7 @@ HTTP 端到端（1501-token prompt，/v1/completions，命中 93 块）：
 | 部分命中的性能依赖长历史 | 阈值默认 1024；短历史自动回退全量（避免负收益） |
 | 历史读取逐层进行 | 不做全历史副本（预取会翻倍显存）；峰值 ~8MB/层 |
 | LRU 淘汰 | 已实现链感知（优先淘汰链尾）；上限 75% |
+| LRU 顺序 | `_cached_lru` 头旧尾新；登记/最后释放入尾，命中移出；淘汰最旧叶节点 |
 | 容量记账 | 命中块从新块需求中扣除；完全命中时 COW 私有块计为新块 |
 | 无跨进程持久化 | 缓存随进程生命周期 |
 | 强制淘汰会牺牲缓存命中率 | 高负载时可用性优先（请求成功 > 缓存命中）；`QWEN3_CACHE_EVICT_ON_DEMAND=0` 可切回"拒绝"策略 |
