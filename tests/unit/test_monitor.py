@@ -45,7 +45,8 @@ def test_snapshot_structure_and_values():
     assert snap["kv"]["cache_capacity"] == 12
     assert snap["ttft_s"]["count"] == 4
     assert snap["ttft_s"]["p50"] > 0
-    assert snap["prefix_cache"] == {"hits": 3, "hit_blocks": 48}
+    assert snap["prefix_cache"] == {"hits": 3, "hit_blocks": 48,
+                                     "evictions": 0}
     assert snap["gpu"] is None                     # CPU 设备无 GPU 字段
     assert snap["timestamp"] > 0
     assert snap["uptime_s"] >= 0
@@ -118,5 +119,6 @@ def test_snapshot_works_without_lock():
     )
     snap = snapshot(engine)
     assert snap["ttft_s"]["count"] == 1
-    assert snap["prefix_cache"] == {"hits": 0, "hit_blocks": 0}
+    assert snap["prefix_cache"] == {"hits": 0, "hit_blocks": 0,
+                                     "evictions": 0}
     assert snap["uptime_s"] > 0                  # start_time=0 → 运行时长很大

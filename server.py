@@ -528,6 +528,10 @@ def render_metrics(engine, model_id: str = "") -> str:
     emit("engine_prefix_cache_capacity_blocks", "gauge",
          "缓存块上限（LRU 淘汰阈值）",
          [f"engine_prefix_cache_capacity_blocks {pool.max_cached_blocks}"])
+    emit("engine_prefix_cache_evictions_total", "counter",
+         "容量压力下强制淘汰的缓存块数",
+         [f"engine_prefix_cache_evictions_total "
+          f"{getattr(pool, 'cache_evictions', 0)}"])
     emit("engine_uptime_seconds", "gauge",
          "进程运行时长（秒）",
          [f"engine_uptime_seconds {time.perf_counter() - m.start_time:.3f}"])

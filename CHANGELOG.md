@@ -5,6 +5,17 @@
 
 ---
 
+## 2026-11-27 — 容量不足时强制淘汰缓存（可用性优先）
+
+- `KVCachePool.evict_cache_for(n)`：容量压力下按链感知淘汰 ref=0 缓存块
+- `Scheduler._ensure_capacity`：容量不足时先淘汰再重试分配；
+  `QWEN3_CACHE_EVICT_ON_DEMAND=0` 可退回"直接拒绝"（可预测性优先）
+- 指标：`engine_prefix_cache_evictions_total` / JSON 快照 `prefix_cache.evictions`
+- 测试：`tests/unit/test_cache_eviction.py`（6）
+- 文档：PREFIX_CACHE / LEARN_02 / API / TESTING
+
+---
+
 ## 2026-11-27 — 训推同机监控接口
 
 - 新增 `qwen3/monitoring.py`：`snapshot` / `append_snapshot` / `write_snapshot`

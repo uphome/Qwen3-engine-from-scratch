@@ -67,6 +67,7 @@ Listening on http://127.0.0.1:8000
 | `engine_kv_used_ratio` | gauge | KV 池物理块占用率（含图占位块） |
 | `engine_kv_free_blocks` / `engine_kv_total_blocks` | gauge | KV 池块数 |
 | `engine_uptime_seconds` | gauge | 进程运行时长 |
+| `engine_prefix_cache_evictions_total` | counter | 容量压力下强制淘汰的缓存块数 |
 | `engine_ttft_seconds` | summary | 首 token 延迟（p50/p95/p99 + count/sum） |
 | `engine_model_info{model=...}` | gauge | 模型元信息（值恒 1） |
 

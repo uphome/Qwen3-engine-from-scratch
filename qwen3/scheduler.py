@@ -41,12 +41,35 @@ class Scheduler:
             chunk_size = int(os.environ.get("QWEN3_CHUNK_SIZE", "512"))
         self.chunk_size = max(0, chunk_size)
         self._prefill_turn = False   # 上一步是否 prefill（与 decode 交替）
+        # 容量不足时是否强制淘汰 ref=0 的缓存块（可用性优先，vLLM 同款思路）
+        self.evict_on_demand = (
+            os.environ.get("QWEN3_CACHE_EVICT_ON_DEMAND", "1") != "0"
+        )
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.finished: list[Request] = []
         self.step = 0
 
     # ---- 入队 ----
+
+    def _ensure_capacity(self, req: Request, need: int, reserved_blocks: int):
+        """确保有 need 个新块可用；不足时先淘汰 ref=0 的缓存块再重试
+
+        缓存淘汰只动 `_cached_lru`（ref=0），当前请求已匹配的块
+        （ref>0）不受影响。QWEN3_CACHE_EVICT_ON_DEMAND=0 可关闭。
+        """
+        available = self.pool.free_count - reserved_blocks
+        if need <= available:
+            return
+        if self.evict_on_demand:
+            self.pool.evict_cache_for(need - available)
+            available = self.pool.free_count - reserved_blocks
+            if need <= available:
+                return
+        raise RuntimeError(
+            f"[Scheduler] 池剩余 {self.pool.free_count} 块"
+            f"（已入队 {reserved_blocks}，缓存淘汰后仍不足），"
+            f"req {req.request_id} 需要 {need} 块，拒绝入队")
 
     def add(self, req: Request, reserved_blocks: int = 0) -> int:
         """新请求入队：分配 kv_cache 句柄；尝试前缀缓存（完全 / 部分命中）
@@ -57,7 +80,6 @@ class Scheduler:
             命中的缓存块数（0 = 未命中，走正常 prefill）
         """
         bs = self.pool.block_size
-        needed_total = (req.input_len + bs - 1) // bs
         # 含 decode 空间的容量需求（预检保护；命中块会从需求中扣除）
         needed_full = (req.input_len + req.max_new_tokens + bs - 1) // bs
         req.kv_cache = PagedKVCache(self.pool)
@@ -75,11 +97,8 @@ class Scheduler:
             # ---- 阶段 1：完全命中（块对齐 + 全部命中）→ 跳过 prefill ----
             if hashes and len(matched) == len(hashes) and req.input_len % bs == 0:
                 # COW 私有块计为新块：复用块数 = len(matched) - 1
-                if needed_full - (len(matched) - 1) > self.pool.free_count - reserved_blocks:
-                    raise RuntimeError(
-                        f"[Scheduler] 池空闲块不足（{self.pool.free_count} - "
-                        f"已入队 {reserved_blocks}），"
-                        f"无法为 req {req.request_id} 做 COW")
+                self._ensure_capacity(req, needed_full - (len(matched) - 1),
+                                      reserved_blocks)
                 # COW 最后一个块：首个 decode 要重算 prompt 末 token 的 logits
                 last, last_hash = matched[-1], hashes[-1]
                 priv = self.pool.alloc(1)[0]
@@ -107,13 +126,8 @@ class Scheduler:
                     self.pool.release_block(b, h)
                 matched = []
             if matched:
-                new_pages = needed_full - len(matched)
-                if new_pages > self.pool.free_count - reserved_blocks:
-                    raise RuntimeError(
-                        f"[Scheduler] 池剩余 {self.pool.free_count} 块"
-                        f"（已入队 {reserved_blocks}），"
-                        f"req {req.request_id} 命中 {len(matched)} 块后仍需 "
-                        f"{new_pages} 块，拒绝入队")
+                self._ensure_capacity(req, needed_full - len(matched),
+                                      reserved_blocks)
                 req.kv_cache.bind_prefix(matched, hashes[:len(matched)])
                 offset = len(matched) * bs
                 req.kv_cache.seq_len = offset
@@ -123,10 +137,7 @@ class Scheduler:
                 return len(matched)
 
             # ---- 未命中：普通 prefill ----
-            if needed_full > self.pool.free_count - reserved_blocks:
-                raise RuntimeError(
-                    f"[Scheduler] 池剩余 {self.pool.free_count} 块，"
-                    f"请求 {req.request_id} prefill 需要 {needed_total} 块，拒绝入队")
+            self._ensure_capacity(req, needed_full, reserved_blocks)
             self.waiting.append(req)
             return 0
 

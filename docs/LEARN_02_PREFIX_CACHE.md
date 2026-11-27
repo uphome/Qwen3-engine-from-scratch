@@ -468,6 +468,69 @@ free_count + cached_count + active(ref>0) == total_blocks
 
 ---
 
+## 7.5 容量压力下的强制淘汰（可用性 vs 缓存命中率）
+
+前面的规则是"缓存满 → 淘汰最旧/链尾"；但**自由块不足时时怎么办**？
+早期实现是：
+
+```
+Scheduler.add → 容量检查 → 不足 → 直接拒绝（503/OOM）
+```
+
+即使缓存池里有大量 `ref=0` 的块可以腾出来，也会拒绝请求。这是"可预测性优先"
+的取舍（缓存是纯优化，不该改变行为）。
+
+后来改成 **vLLM 同款策略：可用性优先**：
+
+```python
+def _ensure_capacity(self, req, need, reserved_blocks):
+    available = self.pool.free_count - reserved_blocks
+    if need <= available:
+        return
+    if self.evict_on_demand:                 # QWEN3_CACHE_EVICT_ON_DEMAND != "0"
+        self.pool.evict_cache_for(need - available)
+        available = self.pool.free_count - reserved_blocks
+        if need <= available:
+            return
+    raise RuntimeError(...)                   # 缓存全淘汰完仍不足
+```
+
+`evict_cache_for` 的语义：
+
+```python
+def evict_cache_for(self, need):
+    freed = 0
+    while freed < need and self._evict_one():   # 链感知：叶节点优先
+        freed += 1
+    self.cache_evictions += freed
+    return freed
+```
+
+关键保护：
+
+1. **只淘汰 `_cached_lru` 里的块**（ref=0）——活跃请求持有的块（ref>0）
+   天然不在 LRU，不会被误动
+2. **链感知**：优先淘汰链尾，尽量保住长前缀链
+3. **只淘汰到够用为止**（不是清空）
+4. **开关**：`QWEN3_CACHE_EVICT_ON_DEMAND=0` 退回"直接拒绝"（可预测性优先）
+5. **指标**：`engine_prefix_cache_evictions_total` 观察淘汰频率
+
+测试（`tests/unit/test_cache_eviction.py`，6 个用例）：
+
+| 用例 | 验证 |
+|---|---|
+| `test_evict_on_demand_frees_space` | 容量不足 → 淘汰后请求成功 |
+| `test_evict_not_triggered_when_space_enough` | 空间足够 → 不淘汰 |
+| `test_evict_does_not_touch_active_blocks` | ref>0 的块不被淘汰 |
+| `test_evict_disabled_raises` | 开关关闭 → 拒绝（原行为） |
+| `test_evict_insufficient_still_raises` | 缓存淘汰完仍不足 → 拒绝 |
+| `test_eviction_metrics_visible` | 指标（JSON 快照 + Prometheus 文本）可见 |
+
+**面试视角**：这是"缓存满了应该拒绝还是淘汰"的经典权衡——
+离线批处理可重试（拒绝可接受），在线低延迟服务应优先保证请求成功（淘汰缓存）。
+实现上要注意"淘汰与正在匹配"的顺序：`match_prefix_partial` 先 ref++，
+命中块移出 LRU，淘汰不会影响当前请求。
+
 ## 8. 测试怎么覆盖
 
 | 用例 | 验证点 |

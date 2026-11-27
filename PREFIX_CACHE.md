@@ -57,6 +57,7 @@ block_refs[blk]          引用计数（活跃请求持有 > 0）
 | 请求释放块（有 hash） | `ref--`；归零后**放回 LRU 保留 K/V** |
 | 请求释放块（无 hash） | 清零回 free（decode 生产块） |
 | 缓存超上限 | **链感知 LRU**：优先淘汰叶节点（无子块），避免切断前缀链；全链在缓存时退回 LRU 最旧 |
+| 容量不足（活跃请求需要空间） | **强制淘汰 ref=0 缓存块**（链感知），再重试分配；`QWEN3_CACHE_EVICT_ON_DEMAND=0` 可关闭（退回直接拒绝） |
 
 缓存上限：`max_cached_blocks = 75% × num_blocks`（留 25% 给活跃请求）。
 
@@ -182,6 +183,7 @@ HTTP 端到端（1501-token prompt，/v1/completions，命中 93 块）：
 | `engine_prefix_cache_hit_blocks_total` | counter | 复用块数 |
 | `engine_prefix_cache_cached_blocks` | gauge | 当前可复用缓存块（ref=0） |
 | `engine_prefix_cache_capacity_blocks` | gauge | 缓存上限（LRU 阈值） |
+| `engine_prefix_cache_evictions_total` | counter | 容量压力下强制淘汰的缓存块数 |
 
 ---
 
@@ -204,6 +206,7 @@ HTTP 端到端（1501-token prompt，/v1/completions，命中 93 块）：
 | LRU 淘汰 | 已实现链感知（优先淘汰链尾）；上限 75% |
 | 容量记账 | 命中块从新块需求中扣除；完全命中时 COW 私有块计为新块 |
 | 无跨进程持久化 | 缓存随进程生命周期 |
+| 强制淘汰会牺牲缓存命中率 | 高负载时可用性优先（请求成功 > 缓存命中）；`QWEN3_CACHE_EVICT_ON_DEMAND=0` 可切回"拒绝"策略 |
 | `generate()` 单请求路径 | 不走 Scheduler，不查缓存（请求结束仍登记块，受 LRU 上限约束） |
 | 数值 | 前缀复用不保证 bit 级输出一致（bf16 不同 attention 实现） |
 

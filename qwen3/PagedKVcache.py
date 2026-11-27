@@ -74,6 +74,7 @@ class KVCachePool:
         self.max_cached_blocks = max(1, int(num_blocks * 0.75))
         self.prefix_hits = 0          # 完全命中请求数（统计用）
         self.prefix_hit_blocks = 0    # 复用块数（统计用）
+        self.cache_evictions = 0      # 容量压力下强制淘汰的缓存块数（统计用）
 
     def alloc(self, n: int):
         """从空闲池取出 n 个物理块，返回块 ID 列表
@@ -218,34 +219,57 @@ class KVCachePool:
                         del self._children[parent]
             self._clear_and_free(blk)
 
-    def _evict_cache(self):
-        """淘汰超出上限的缓存块（清零后回空闲池）
+    def _evict_one(self) -> bool:
+        """淘汰一个缓存块（链感知：优先叶节点），返回是否成功
 
         链感知：优先淘汰"叶节点"（没有子块在缓存中的块），
         避免淘汰链头后剩余块无法从 prompt 开头匹配（命中率骤降）。
         若全部块都有子块（整条链都在缓存里），退回 LRU 最旧。
         """
+        if not self._cached_lru:
+            return False
+        victim = None
+        for blk in self._cached_lru:
+            h = self._block_hashes.get(blk)
+            if h is not None and not self._children.get(h):
+                victim = blk
+                break
+        if victim is None:
+            victim = next(iter(self._cached_lru))
+        self._cached_lru.pop(victim, None)
+        h = self._block_hashes.pop(victim, None)
+        parent = self._block_parents.pop(victim, 0)
+        if h is not None:
+            if self._prefix_index.get(h) == victim:
+                del self._prefix_index[h]
+            kids = self._children.get(parent)
+            if kids is not None:
+                kids.discard(h)
+                if not kids:
+                    del self._children[parent]
+        self._clear_and_free(victim)
+        return True
+
+    def _evict_cache(self):
+        """缓存超过上限时按 LRU/链感知淘汰（释放路径的正常容量控制）"""
         while len(self._cached_lru) > self.max_cached_blocks:
-            victim = None
-            for blk in self._cached_lru:
-                h = self._block_hashes.get(blk)
-                if h is not None and not self._children.get(h):
-                    victim = blk
-                    break
-            if victim is None:
-                victim = next(iter(self._cached_lru))
-            self._cached_lru.pop(victim, None)
-            h = self._block_hashes.pop(victim, None)
-            parent = self._block_parents.pop(victim, 0)
-            if h is not None:
-                if self._prefix_index.get(h) == victim:
-                    del self._prefix_index[h]
-                kids = self._children.get(parent)
-                if kids is not None:
-                    kids.discard(h)
-                    if not kids:
-                        del self._children[parent]
-            self._clear_and_free(victim)
+            if not self._evict_one():
+                break
+
+    def evict_cache_for(self, need: int) -> int:
+        """容量压力下强制淘汰 ref=0 的缓存块，为活跃请求腾出空间
+
+        Args:
+            need: 需要增加的 free 块数
+        Returns:
+            实际释放的块数（可能 < need，说明缓存已空）
+        仅淘汰 `_cached_lru` 中的块（ref=0）；被活跃请求持有的块不受影响。
+        """
+        freed = 0
+        while freed < need and self._evict_one():
+            freed += 1
+        self.cache_evictions += freed
+        return freed
 
     # ---- 常驻 2D 块表：行槽位管理 ----
 

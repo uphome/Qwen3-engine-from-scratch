@@ -114,6 +114,7 @@ def snapshot(engine, model_id: str = "") -> dict[str, Any]:
         "prefix_cache": {
             "hits": getattr(m, "prefix_cache_hits_total", 0),
             "hit_blocks": getattr(m, "prefix_cache_hit_blocks_total", 0),
+            "evictions": getattr(pool, "cache_evictions", 0),
         },
         "gpu": gpu,
     }
