@@ -48,6 +48,23 @@
 
 ---
 
+## 2026-11-27 — Qwen3-4B 验证 + tied embedding 修复
+
+- **发现兼容性 bug**：Qwen3-4B 的 `tie_word_embeddings=True`，HF 权重里没有
+  `lm_head.weight`；旧代码会让 lm_head 保持随机初始化（输出错误）
+- 修复：
+  · `Qwen3ForCausalLM`：tied 时 `lm_head.weight = embed_tokens.weight`（共享参数）
+  · `load_weights_from_safetensors`：用 embed 引用补齐 lm_head，避免 missing 警告
+  · 顺带省 778MB 显存（4B 的 vocab×hidden 权重）
+- 测试：`tests/unit/test_tied_embedding.py`（3）：共享 Parameter / 独立对照 / logits 手工核对
+- 4B 实测（36 层 / hidden 2560 / 32 heads / 8 KV heads）：
+  · 加载 19.4s，显存 7.7GB（修复前 8.5GB）
+  · 图 decode **12.8 ms/tok**；batch=8 **399.7 tok/s**
+  · 真实文本输出正常（"你好，我叫通义千问…"）
+  · 数据：`results/engine_4b.json`
+
+---
+
 ## 2026-11-27 — Qwen3-1.7B 单卡验证（config 驱动，零代码改动）
 
 - 同一套引擎直接跑 `Qwen3-1.7B`（28 层 / hidden 2048 / 16 heads / 8 KV heads）

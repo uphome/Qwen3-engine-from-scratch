@@ -244,6 +244,12 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(config)
         # lm_head: 将 hidden_states 映射到 vocab_size 维度, 输出每个 token 的概率
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if getattr(config, "tie_word_embeddings", False):
+            # tied embedding（如 Qwen3-4B）：lm_head 与 embed_tokens 共享同一份
+            # 权重（HF 权重文件里没有 lm_head.weight）。共享后：
+            #   ① 权重加载只加载 embed，lm_head 自动同步
+            #   ② 省一份 vocab×hidden 的显存（4B 约 778MB）
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor,
                 kv_cache=None, input_lens: list[int] | None = None,

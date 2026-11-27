@@ -106,6 +106,15 @@ def load_weights_from_safetensors(model: nn.Module, model_path: str, device: tor
     # 数据类型转换，device 转换
     state_dict = {k: v.to(device=device, dtype=dtype) for k, v in state_dict.items()}
 
+    # tied embedding：HF 权重里没有 lm_head.weight，用 embed_tokens 的引用补齐
+    # （模型侧 lm_head 与 embed 是共享 Parameter，这里只是让 load_state_dict
+    #  不报 missing；copy_ 到同一份权重）
+    config = getattr(model, "config", None)
+    if (getattr(config, "tie_word_embeddings", False)
+            and "lm_head.weight" not in state_dict
+            and "model.embed_tokens.weight" in state_dict):
+        state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
+
     # 加载权重到模型
     result = model.load_state_dict(state_dict, strict=False)
     if result.missing_keys:
