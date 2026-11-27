@@ -160,7 +160,7 @@ python scripts/make_bench_report.py --engine-json results/engine.json \
 
 ## 文档
 
-- [docs/](docs/) — **学习文档（5 篇，结合代码逐段讲解）**：流式 / 前缀缓存 / 调度 / 测试压测 / 训推同机监控
+- [docs/](docs/) — **学习文档（6 篇，结合代码逐段讲解）**：流式 / 前缀缓存 / 调度 / 测试压测 / 训推同机监控 / 块池状态机
 - [API.md](API.md) — OpenAI 兼容 API 与 `/metrics`
 - [PREFIX_CACHE.md](PREFIX_CACHE.md) — 哈希 KV 复用（完全/部分命中）
 - [TESTING.md](TESTING.md) — 测试矩阵与压测复现

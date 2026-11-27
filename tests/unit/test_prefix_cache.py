@@ -116,6 +116,29 @@ def test_full_hit_skips_prefill_and_shares_blocks(kv_pool_factory):
     assert pool.free_count + pool.cached_count == pool.total_blocks
 
 
+def test_cow_release_keeps_parent_chain(kv_pool_factory):
+    """COW 释放已命中的末块时，不能把缓存块父链覆盖成 0"""
+    pool = kv_pool_factory(num_blocks=16, max_seq_len=64)
+    sched = Scheduler(pool, batch_size=2)
+
+    ids = list(range(32))
+    a = make_req(0, ids)
+    sched.add(a)
+    complete_prefill(sched, a, pool)
+    finish_req(sched, a)                       # 两块登记为缓存，父链 h0 → h1
+
+    h0, h1 = compute_prefix_hashes(ids, BS)
+    b1 = pool._prefix_index[h1]
+    assert pool._block_parents[b1] == h0
+    assert h1 in pool._children[h0]
+
+    b = make_req(1, ids)
+    assert sched.add(b) == 1                   # 完全命中：末块 COW + release
+    assert pool._prefix_index[h1] == b1        # 原块仍是缓存
+    assert pool._block_parents[b1] == h0       # 父链不被 COW 的默认 parent=0 覆盖
+    assert h1 in pool._children[h0]
+
+
 def test_ref_count_while_shared_by_active_request(kv_pool_factory):
     pool = kv_pool_factory(num_blocks=16, max_seq_len=64)
     sched = Scheduler(pool, batch_size=2)

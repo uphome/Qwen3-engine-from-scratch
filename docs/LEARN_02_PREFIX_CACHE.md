@@ -3,7 +3,8 @@
 > 对应代码：`qwen3/prefix_cache.py`、`qwen3/PagedKVcache.py`、`qwen3/scheduler.py`
 > （`Scheduler.add`）、`qwen3/batch.py`、`qwen3/model.py`、`qwen3/attention.py`、
 > `qwen3/paged_attention.py`、`tests/unit/test_prefix_cache.py`
-> 关联文档：[PREFIX_CACHE.md](../PREFIX_CACHE.md)（设计与实测）
+> 关联文档：[PREFIX_CACHE.md](../PREFIX_CACHE.md)（设计与实测）、
+> [LEARN_06_BLOCK_POOL_STATE_MACHINE.md](LEARN_06_BLOCK_POOL_STATE_MACHINE.md)（块池三态/COW/淘汰的逐状态讲解）
 
 ---
 

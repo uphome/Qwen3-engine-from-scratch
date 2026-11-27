@@ -191,7 +191,7 @@ HTTP 端到端（1501-token prompt，/v1/completions，命中 93 块）：
 
 | 文件 | 覆盖 |
 |---|---|
-| `tests/unit/test_prefix_cache.py`（9） | 哈希链、完全命中/COW、部分命中/后缀组装、ref 共享、LRU、池闭环 |
+| `tests/unit/test_prefix_cache.py`（11） | 哈希链、完全命中/COW、部分命中/后缀组装、ref 共享、LRU、父链一致性、池闭环 |
 | `tests/model/test_prefix_prefill.py`（4） | 部分命中 vs 全量 prefill logits（CPU fp32，含 1-token 后缀） |
 | `tests/kernels/test_flash_prefill.py`（2, gpu） | flash 普通 varlen / 历史路径（q/kv 长度分离）数值正确性 |
 

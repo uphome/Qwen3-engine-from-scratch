@@ -49,7 +49,7 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 | `tests/unit/test_monitor.py` | 训推同机快照结构、JSONL 追加、与 Prometheus 口径一致 | 5 |
 | `tests/unit/test_cache_eviction.py` | 容量不足时强制淘汰缓存块（开关/ref 保护/指标） | 6 |
 | `tests/unit/test_stream_engine.py` | 流式 token 推送顺序、取消清理/归还、流式==非流式 | 3 |
-| `tests/unit/test_prefix_cache.py` | 块哈希链、完全/部分命中、COW、后缀组装、引用计数、LRU、池闭环 | 9 |
+| `tests/unit/test_prefix_cache.py` | 块哈希链、完全/部分命中、COW、后缀组装、引用计数、LRU、父链一致性、池闭环 | 11 |
 | `tests/model/test_prefix_prefill.py` | 部分命中 vs 全量 prefill logits（CPU fp32） | 4 |
 | `tests/kernels/test_flash_prefill.py` | flash 普通 varlen / 历史路径（q/kv 长度分离） | 2 |
 | `tests/unit/test_chunked_prefill.py` | 长 prompt 切片、chunk 与 decode 交替、状态机、池闭环 | 4 |

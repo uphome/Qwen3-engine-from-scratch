@@ -178,9 +178,10 @@ class KVCachePool:
                 self._evict_cache()
                 return
             if existing == block_id:
-                # 原本就是缓存块（被命中复用）：恢复 LRU 待用
-                self._block_hashes[block_id] = block_hash
-                self._block_parents[block_id] = parent_hash
+                # 原本就是缓存块（被命中复用）：只恢复 LRU 待用。
+                # 哈希/父链在首次登记时已正确；match 只把块移出 LRU，
+                # 未修改索引。COW/回滚路径可能传 parent_hash=0，
+                # 若在这里覆盖会把父链打断（链感知淘汰退化）。
                 self._cached_lru[block_id] = None
                 self._evict_cache()
                 return

@@ -5,6 +5,24 @@
 
 ---
 
+## 2026-11-27 — 修复 COW/回滚释放导致父链退化
+
+- `KVCachePool.release_block` 的 `existing == block_id` 分支不再用调用方
+  `parent_hash`（COW/回滚默认 0）覆盖已登记父链；只恢复 LRU
+- 新增回归测试：`tests/unit/test_prefix_cache.py::test_cow_release_keeps_parent_chain`
+- `docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md` 记录该踩坑
+
+---
+
+## 2026-11-27 — 学习文档 06：KV 块池状态机
+
+- `docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md`：块表 vs 状态机、2×2 三态模型、
+  `alloc/match/release/evict` 全部迁移、COW/共享/容量淘汰、行槽位、
+  不变量检查器、动手实验与自测题
+- `docs/README.md` 索引、README 文档入口、LEARN_02 交叉链接同步
+
+---
+
 ## 2026-11-27 — 容量不足时强制淘汰缓存（可用性优先）
 
 - `KVCachePool.evict_cache_for(n)`：容量压力下按链感知淘汰 ref=0 缓存块
