@@ -799,6 +799,12 @@ def check_pool(pool):
 > 注意 `cached <= set(_prefix_index.values())` 而不是相等：
 > `_prefix_index` 里还可能有被命中的 SHARED 块（ref>0）。
 
+代码里也提供了只读的 `KVCachePool.block_state(block_id)`，返回
+`BLOCK_FREE / BLOCK_OWNED / BLOCK_SHARED / BLOCK_CACHED`；它和 `check_pool`
+一样由现有字段派生，不单独存储状态。测试
+`tests/unit/test_kv_pool.py::test_block_state_reports_four_runtime_states`
+构造四态共存并验证四态分区。
+
 ---
 
 ## 12. 动手实验
@@ -829,6 +835,8 @@ print("free:", pool.free_count)
 print("cached:", pool.cached_count)                    # 2
 print("LRU:", list(pool._cached_lru))
 print("refs:", pool.block_refs)
+print("states:", {b: pool.block_state(b)
+                  for b in range(pool.total_blocks)})
 
 # 再命中
 c2 = PagedKVCache(pool)
@@ -936,6 +944,7 @@ pytest tests/unit/test_cache_eviction.py::test_evict_disabled_raises -q
 | 手动清空 | `KVCachePool.clear_prefix_cache` |
 | 行槽位 | `KVCachePool.alloc_row` / `free_row` |
 | 请求级句柄/块表 | `qwen3/PagedKVcache.py::PagedKVCache` |
+| 运行时四态查询（只读） | `KVCachePool.block_state` |
 | 完全命中 + COW | `qwen3/scheduler.py::Scheduler.add` |
 | 请求结束释放 | `qwen3/PagedKVcache.py::PagedKVCache.free` |
 | Request 状态机 | `qwen3/request.py` |

@@ -18,6 +18,14 @@ from collections import OrderedDict
 from .kernels.paged_attention import update_kv_batch_triton
 
 
+# 物理块运行时状态（由 free_block_ids / block_refs / _prefix_index / _cached_lru 派生）
+# 详见 docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md
+BLOCK_FREE = "free"        # 空闲，可分配
+BLOCK_OWNED = "owned"      # ref>0，未登记索引（新 prefill/decode 块，不可共享）
+BLOCK_SHARED = "shared"    # ref>0，已登记索引（命中缓存，可被其他请求共享）
+BLOCK_CACHED = "cached"    # ref=0，保留 K/V 等待复用（可被命中/淘汰）
+
+
 class KVCachePool:
     """全局物理块池——所有请求共享，进程启动时创建一次"""
 
@@ -58,10 +66,10 @@ class KVCachePool:
         self.total_blocks = num_blocks
 
         # ---- 前缀缓存（阶段 1：完全命中）----
-        # block_refs: 每块引用计数（0 = 空闲 / 缓存待用；>0 = 活跃请求持有）
-        # _prefix_index: 块哈希 -> 物理块（只含内容完整、ref 可复用的块）
-        # _block_hashes: 物理块 -> 哈希（淘汰时反向删除索引）
-        # _cached_lru:   ref=0 的可淘汰缓存块（LRU 顺序）
+        # block_refs: 每块引用计数（0 = FREE/CACHED；>0 = OWNED/SHARED）
+        # _prefix_index: 块哈希 -> 物理块（CACHED + SHARED；OWNED 在 release 时登记）
+        # _block_hashes: 物理块 -> 哈希（CACHED + SHARED；淘汰时反向删除索引）
+        # _cached_lru:   CACHED 块（ref=0，LRU 淘汰顺序）
         self.block_refs = [0] * num_blocks
         self._prefix_index: dict[int, int] = {}
         self._block_hashes: dict[int, int] = {}
@@ -77,7 +85,7 @@ class KVCachePool:
         self.cache_evictions = 0      # 容量压力下强制淘汰的缓存块数（统计用）
 
     def alloc(self, n: int):
-        """从空闲池取出 n 个物理块，返回块 ID 列表
+        """FREE → OWNED：从空闲池取出 n 个物理块，返回块 ID 列表
 
         归还后重新分发的块先清零 K/V 内容：新请求的 prefill 只覆盖自己写入的
         槽位，若不清零，decode 的 seq_len 增长到未覆盖槽时会读到上一请求的
@@ -98,7 +106,7 @@ class KVCachePool:
         return allocated
 
     def free(self, block_ids: list):
-        """归还物理块（立即回空闲池，不做前缀缓存登记）
+        """任意状态 → FREE：直接归还物理块（不登记前缀缓存）
 
         普通路径（测试 / 占位句柄 / 哑行）用；请求级释放走
         PagedKVCache.free() → release_block()（会把完整块登记为缓存）。
@@ -115,17 +123,38 @@ class KVCachePool:
     def free_count(self):
         return len(self.free_block_ids)
 
+    def block_state(self, block_id: int) -> str:
+        """返回物理块的运行时状态（只读调试/测试/监控用）
+
+        四态（与 docs/LEARN_06_BLOCK_POOL_STATE_MACHINE.md 一致）：
+          - BLOCK_FREE:   ref=0，在 free_block_ids，未登记索引
+          - BLOCK_OWNED:  ref>0，未登记索引（新 prefill/decode 块，不可共享）
+          - BLOCK_SHARED: ref>0，已登记索引（命中缓存，可被其他请求共享）
+          - BLOCK_CACHED: ref=0，在 _cached_lru（保留 K/V，可被命中/淘汰）
+
+        状态由现有字段派生，不单独存储，避免多份真相不一致。
+        """
+        if not 0 <= block_id < self.total_blocks:
+            raise IndexError(
+                f"block_id 越界: {block_id}（total_blocks={self.total_blocks}）")
+        if block_id in self._cached_lru:
+            return BLOCK_CACHED
+        if self.block_refs[block_id] == 0:
+            return BLOCK_FREE
+        return BLOCK_SHARED if block_id in self._block_hashes else BLOCK_OWNED
+
     # ---- 前缀缓存：匹配 / 引用 / 淘汰 ----
 
     @property
     def cached_count(self) -> int:
-        """当前可复用的缓存块数（ref=0，未淘汰）"""
+        """当前 CACHED 块数（ref=0，未淘汰）"""
         return len(self._cached_lru)
 
     def match_prefix_partial(self, hashes: list[int]) -> list[int]:
         """最长前缀匹配：逐块查，遇到 miss 停止
 
-        返回已命中的块列表（ref++，从 LRU 移出）。调用方负责：
+        CACHED → SHARED：命中块 ref++，从 LRU 移出，但仍留在索引中。
+        调用方负责：
           - 全命中 → 阶段 1 快速路径
           - 部分命中 → 绑定前缀块，prefill 后缀
           - 放弃使用 → 对每个块 release_block(blk, hashes[i])
@@ -154,10 +183,12 @@ class KVCachePool:
 
     def release_block(self, block_id: int, block_hash: int | None = None,
                       parent_hash: int = 0):
-        """请求释放块：ref--，归零后按规则处理
+        """请求释放块：ref--，归零后按状态迁移
 
-        - 有哈希（完整 prompt 块）→ 恢复/登记为缓存块（保留 K/V，LRU 可淘汰）
-        - 无哈希（decode 生产块 / 不完整块）→ 清零回空闲池
+        - OWNED + hash（同哈希无其他块）→ CACHED（新登记，保留 K/V）
+        - SHARED + hash（命中复用）→ CACHED（恢复 LRU）
+        - OWNED + hash=None → FREE（decode 块 / 不完整块）
+        - OWNED + 同哈希已有其他块 → FREE（重复内容）
 
         parent_hash 用于维护哈希链（链感知淘汰：优先淘汰链尾）。
         注意命中复用的情况：块一直在 `_prefix_index` 里（内容有效），
@@ -205,7 +236,7 @@ class KVCachePool:
         self.free_block_ids.append(block_id)
 
     def clear_prefix_cache(self):
-        """清空前缀缓存（基准测试每轮重置，避免同一组 prompt 命中污染对比）"""
+        """CACHED → FREE：清空前缀缓存（基准测试每轮重置，避免同一组 prompt 命中污染对比）"""
         while self._cached_lru:
             blk, _ = self._cached_lru.popitem(last=False)
             h = self._block_hashes.pop(blk, None)
@@ -221,7 +252,7 @@ class KVCachePool:
             self._clear_and_free(blk)
 
     def _evict_one(self) -> bool:
-        """淘汰一个缓存块（链感知：优先叶节点），返回是否成功
+        """CACHED → FREE：淘汰一个缓存块（链感知：优先叶节点），返回是否成功
 
         链感知：优先淘汰"叶节点"（没有子块在缓存中的块），
         避免淘汰链头后剩余块无法从 prompt 开头匹配（命中率骤降）。
@@ -252,19 +283,19 @@ class KVCachePool:
         return True
 
     def _evict_cache(self):
-        """缓存超过上限时按 LRU/链感知淘汰（释放路径的正常容量控制）"""
+        """CACHED → FREE：缓存超过上限时按 LRU/链感知淘汰（释放路径的正常容量控制）"""
         while len(self._cached_lru) > self.max_cached_blocks:
             if not self._evict_one():
                 break
 
     def evict_cache_for(self, need: int) -> int:
-        """容量压力下强制淘汰 ref=0 的缓存块，为活跃请求腾出空间
+        """CACHED → FREE：容量压力下强制淘汰，为活跃请求腾出空间
 
         Args:
             need: 需要增加的 free 块数
         Returns:
             实际释放的块数（可能 < need，说明缓存已空）
-        仅淘汰 `_cached_lru` 中的块（ref=0）；被活跃请求持有的块不受影响。
+        仅淘汰 `_cached_lru` 中的块（CACHED, ref=0）；被活跃请求持有的块不受影响。
         """
         freed = 0
         while freed < need and self._evict_one():
@@ -447,7 +478,7 @@ class PagedKVCache:
         self._pool.seq_lens[self.row_id] = self.seq_len
 
     def free(self):
-        """归还所有物理块（完整 prompt 块登记进前缀缓存）+ 归还常驻表行号"""
+        """归还所有物理块（OWNED/SHARED → CACHED/FREE）+ 归还常驻表行号"""
         if self.block_table:
             for i, blk in enumerate(self.block_table):
                 h = self.block_hashes[i] if i < len(self.block_hashes) else None

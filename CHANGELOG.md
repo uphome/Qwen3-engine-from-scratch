@@ -5,6 +5,19 @@
 
 ---
 
+## 2026-11-27 — 块池四态查询接口与注释对齐
+
+- 新增 `KVCachePool.block_state(block_id)`：只读派生
+  `BLOCK_FREE / BLOCK_OWNED / BLOCK_SHARED / BLOCK_CACHED`
+  （不新增存储字段，避免多份真相不一致）
+- 新增常量 `BLOCK_*`；`alloc/match/release/evict` 的注释与 docstring
+  统一为四态描述
+- 测试：`tests/unit/test_kv_pool.py::test_block_state_reports_four_runtime_states`
+  构造四态共存并验证互斥/覆盖
+- 文档：LEARN_06 增加 `block_state()` 与检查器说明；TESTING 用例数同步
+
+---
+
 ## 2026-11-27 — 文档：块池运行时四态模型
 
 - 把 `active` 拆成两个运行时状态：

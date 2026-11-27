@@ -3,7 +3,14 @@
 import pytest
 import torch
 
-from qwen3.PagedKVcache import PagedKVCache
+from qwen3.PagedKVcache import (
+    BLOCK_CACHED,
+    BLOCK_FREE,
+    BLOCK_OWNED,
+    BLOCK_SHARED,
+    PagedKVCache,
+)
+from qwen3.prefix_cache import compute_prefix_hashes
 
 BLOCK = 16
 
@@ -145,3 +152,47 @@ def test_overflow_max_seq_len_raises(kv_pool_factory):
     cache.advance_seq_len(32)          # 2 页已写满
     with pytest.raises(AssertionError, match="max_seq_len"):
         cache.update(0, torch.randn(1, Hkv, 1, D), torch.randn(1, Hkv, 1, D))
+
+
+def test_block_state_reports_four_runtime_states(kv_pool_factory):
+    """FREE / OWNED / SHARED / CACHED 四态互斥且覆盖全部物理块"""
+    pool = kv_pool_factory(num_blocks=8, block_size=BLOCK, max_seq_len=128)
+    Hkv, D = pool.num_kv_heads, pool.head_dim
+
+    # CACHED：完整 prefill 后释放，登记 2 个缓存块
+    ids = list(range(2 * BLOCK))
+    cache = PagedKVCache(pool)
+    cache.update(0, torch.randn(1, Hkv, 2 * BLOCK, D),
+                 torch.randn(1, Hkv, 2 * BLOCK, D))
+    cache.advance_seq_len(2 * BLOCK)
+    cache.block_hashes[:2] = compute_prefix_hashes(ids, BLOCK)
+    cache.free()
+
+    # SHARED：命中其中 1 块（ref=1，仍在索引里）
+    hashes = compute_prefix_hashes(ids, BLOCK)
+    shared = pool.match_prefix_partial(hashes[:1])[0]
+
+    # OWNED：新请求 prefill 1 块（未登记索引）
+    cache2 = PagedKVCache(pool)
+    cache2.update(0, torch.randn(1, Hkv, BLOCK, D),
+                  torch.randn(1, Hkv, BLOCK, D))
+    owned = cache2.block_table[0]
+
+    states = {b: pool.block_state(b) for b in range(pool.total_blocks)}
+    assert states[owned] == BLOCK_OWNED
+    assert states[shared] == BLOCK_SHARED
+    cached = next(iter(pool._cached_lru))
+    assert states[cached] == BLOCK_CACHED
+    assert list(states.values()).count(BLOCK_FREE) == 5
+
+    # 四态分区：每块恰好属于一个状态，并集为全部块
+    buckets = {s: {b for b, v in states.items() if v == s}
+               for s in set(states.values())}
+    assert set(buckets) == {BLOCK_FREE, BLOCK_OWNED, BLOCK_SHARED, BLOCK_CACHED}
+    assert set().union(*buckets.values()) == set(range(pool.total_blocks))
+    assert sum(len(v) for v in buckets.values()) == pool.total_blocks
+
+    with pytest.raises(IndexError, match="越界"):
+        pool.block_state(-1)
+    with pytest.raises(IndexError, match="越界"):
+        pool.block_state(pool.total_blocks)

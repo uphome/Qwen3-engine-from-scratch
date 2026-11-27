@@ -40,7 +40,7 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 |---|---|---|
 | `tests/unit/test_config.py` | config.json 读取、head_dim 推导、默认值 | 4 |
 | `tests/unit/test_rope.py` | 预计算表数值、查表、rotate_half、位置 0 恒等、范数保持、相对位置性质 | 7 |
-| `tests/unit/test_kv_pool.py` | 块分配/回收、复用清零、行槽位、跨页预留、seq_lens 同步、prefill 写入读回、池闭环、超长报错 | 9 |
+| `tests/unit/test_kv_pool.py` | 块分配/回收、复用清零、行槽位、跨页预留、seq_lens 同步、prefill 写入读回、四态查询、池闭环、超长报错 | 11 |
 | `tests/unit/test_request.py` | 状态机合法/非法迁移、结束判定、输出拼接、finish 归还块 | 9 |
 | `tests/unit/test_batch.py` | prefill 右 pad、decode 组装、input_lens、kv_caches | 4 |
 | `tests/unit/test_scheduler.py` | 组批、prefill 补位不超编、FIFO、完成回收、池闭环 | 7 |
