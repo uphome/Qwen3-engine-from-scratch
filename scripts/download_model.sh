@@ -13,7 +13,7 @@ DEST="${1:-models/Qwen3-0.6B}"
 
 mkdir -p "$DEST"
 
-python - "$MODEL_ID" "$DEST" <<'PY'
+"${PYTHON:-python3}" - "$MODEL_ID" "$DEST" <<'PY'
 import sys
 from huggingface_hub import snapshot_download
 

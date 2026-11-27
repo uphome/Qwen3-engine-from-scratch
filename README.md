@@ -15,6 +15,9 @@ pip install -r requirements.txt
 
 # 2. 下载 Qwen3-0.6B 权重（约 1.2GB，默认到 models/Qwen3-0.6B）
 bash scripts/download_model.sh
+# 国内网络可加镜像（HF_ENDPOINT 由 huggingface_hub 自动读取）：
+# HF_ENDPOINT=https://hf-mirror.com bash scripts/download_model.sh
+# 换模型尺寸：MODEL_ID=Qwen/Qwen3-1.7B bash scripts/download_model.sh models/Qwen3-1.7B
 
 # 3. 运行（交互式：输入 prompt 生成，/quit 退出）
 python main.py --model models/Qwen3-0.6B --temperature 0

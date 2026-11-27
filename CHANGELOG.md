@@ -23,6 +23,17 @@
 
 ---
 
+## 2026-11-27 — Qwen3-1.7B 单卡验证（config 驱动，零代码改动）
+
+- 同一套引擎直接跑 `Qwen3-1.7B`（28 层 / hidden 2048 / 16 heads / 8 KV heads）
+- 权重加载 7.3s，显存 4.1GB；图池捕获正常
+- 单请求 decode：图路径 **7.8 ms/tok**（无图 41.4）
+- 批处理（16 序列，batch 1/2/4/8）：**615.5 tok/s @batch=8**（0.6B 为 683）
+- 原始数据：`results/engine_1.7b.json`
+- `scripts/download_model.sh`：支持 `PYTHON` 指定解释器；README 补镜像用法
+
+---
+
 ## 2026-11-27 — 容量不足时强制淘汰缓存（可用性优先）
 
 - `KVCachePool.evict_cache_for(n)`：容量压力下按链感知淘汰 ref=0 缓存块
