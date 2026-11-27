@@ -66,6 +66,8 @@ curl -X POST http://127.0.0.1:8000/v1/completions \
   2k 历史部分命中 1.3-1.6x；链感知 LRU；设计见 [PREFIX_CACHE.md](PREFIX_CACHE.md)）
 - chunked prefill：长 prompt 切片与 decode 交替（`QWEN3_CHUNK_SIZE`，默认 512），
   短请求 TTFT 改善 2.7x
+- 训推同机监控：`qwen3.monitoring.append_snapshot()` 每步写 JSONL
+  （同进程直接读引擎），或 `GET /metrics?format=json`
 - KV 池按剩余显存自动裁剪（`--kv-ratio`，默认 0.6 留 40% 给 prefill 瞬时激活；
   OOM 就调低，如 `--kv-ratio 0.5`）；推理中途 OOM 会返回 503 且服务不崩
 - 池满时新请求返回 503（不排队）
@@ -158,7 +160,7 @@ python scripts/make_bench_report.py --engine-json results/engine.json \
 
 ## 文档
 
-- [docs/](docs/) — **学习文档（4 篇，结合代码逐段讲解）**：流式 / 前缀缓存 / 调度 / 测试压测
+- [docs/](docs/) — **学习文档（5 篇，结合代码逐段讲解）**：流式 / 前缀缓存 / 调度 / 测试压测 / 训推同机监控
 - [API.md](API.md) — OpenAI 兼容 API 与 `/metrics`
 - [PREFIX_CACHE.md](PREFIX_CACHE.md) — 哈希 KV 复用（完全/部分命中）
 - [TESTING.md](TESTING.md) — 测试矩阵与压测复现

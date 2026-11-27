@@ -36,8 +36,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 
 import torch
+from urllib.parse import parse_qs, urlparse
 
 from qwen3 import Qwen3Config, Qwen3ForCausalLM, KVCachePool, Scheduler
+from qwen3.monitoring import snapshot as engine_snapshot
 from qwen3 import load_weights_from_safetensors
 from qwen3.PagedKVcache import PagedKVCache
 from qwen3.graph_runner import GraphRunner
@@ -614,9 +616,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             })
         elif path == "/metrics":
             srv = self.server
-            self._send_text(
-                200, render_metrics(srv.engine, srv.model_id),
-                "text/plain; version=0.0.4; charset=utf-8")
+            # ?format=json：供训练框架（同机/外部）直接 json.loads；
+            # 默认仍是 Prometheus 文本（向后兼容）
+            query = parse_qs(urlparse(self.path).query)
+            fmt = query.get("format", ["prometheus"])[0].lower()
+            if fmt == "json":
+                self._send_json(200, engine_snapshot(srv.engine, srv.model_id))
+            else:
+                self._send_text(
+                    200, render_metrics(srv.engine, srv.model_id),
+                    "text/plain; version=0.0.4; charset=utf-8")
         else:
             self._error(404, f"未找到 {self.path}", "not_found")
 

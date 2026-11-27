@@ -46,6 +46,7 @@ export TRITON_PTXAS_PATH=/path/to/ptxas   # 如 conda 环境里的 ptxas
 | `tests/unit/test_scheduler.py` | 组批、prefill 补位不超编、FIFO、完成回收、池闭环 | 7 |
 | `tests/unit/test_chat_template.py` | Qwen3 特殊 token、thinking 开关、多轮 | 4 |
 | `tests/unit/test_metrics.py` | Engine 计数/TTFT、容量拒绝计数、Prometheus 格式可解析 | 4 |
+| `tests/unit/test_monitor.py` | 训推同机快照结构、JSONL 追加、与 Prometheus 口径一致 | 5 |
 | `tests/unit/test_stream_engine.py` | 流式 token 推送顺序、取消清理/归还、流式==非流式 | 3 |
 | `tests/unit/test_prefix_cache.py` | 块哈希链、完全/部分命中、COW、后缀组装、引用计数、LRU、池闭环 | 9 |
 | `tests/model/test_prefix_prefill.py` | 部分命中 vs 全量 prefill logits（CPU fp32） | 4 |

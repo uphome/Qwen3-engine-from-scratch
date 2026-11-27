@@ -5,6 +5,19 @@
 
 ---
 
+## 2026-11-27 — 训推同机监控接口
+
+- 新增 `qwen3/monitoring.py`：`snapshot` / `append_snapshot` / `write_snapshot`
+  - 同进程训练（GRPO）每个 step 采集一次引擎状态，JSONL 追加落盘
+  - 字段：requests / scheduler / kv / ttft / prefix_cache / gpu
+  - 与 `/metrics` 文本同口径（TTFT nearest 分位数）
+- `GET /metrics?format=json`：外部进程直接拿到同样结构的 JSON
+- `integrations/grpo_example.py`：可运行的训练侧示例（fake engine 生成 JSONL）
+- `tests/unit/test_monitor.py`（5）：结构、JSONL、分位口径、duck typing
+- 文档：`docs/LEARN_05_TRAINING_MONITORING.md`；API/README/TESTING 同步
+
+---
+
 ## 2026-11-25 — 学习文档（4 篇）
 
 - `docs/LEARN_01_STREAMING.md`：SSE 协议、跨线程 token 队列、增量解码、断开取消

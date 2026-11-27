@@ -78,6 +78,32 @@ curl http://127.0.0.1:8000/metrics
 # ...
 ```
 
+#### JSON 快照（训练/外部监控）
+
+`GET /metrics?format=json` 返回同口径的纯 JSON（文本格式保持不变）：
+
+```bash
+curl http://127.0.0.1:8000/metrics?format=json
+```
+
+```json
+{
+  "timestamp": 1795..., "uptime_s": 3600.2, "model": "qwen3-0.6b",
+  "requests": {"total": 1206, "finished": 1206, "failed": 0, "tokens": 77184},
+  "scheduler": {"running": 0, "waiting": 0, "steps": 8120, "last_batch_size": 1},
+  "kv": {"used_ratio": 0.42, "free_blocks": 155, "total_blocks": 267,
+          "cached_blocks": 96, "cache_capacity": 200},
+  "ttft_s": {"p50": 0.081, "p95": 0.121, "p99": 0.15, "count": 1198, "sum": 97.3},
+  "prefix_cache": {"hits": 120, "hit_blocks": 1536},
+  "gpu": {"device": "cuda:1", "memory_allocated_mb": 412.3,
+           "memory_reserved_mb": 512.0}
+}
+```
+
+同进程训练（GRPO）可以直接调用 `qwen3.monitoring.snapshot(engine)`，
+无需 HTTP；JSONL 落盘用 `append_snapshot(path, engine, step=..., reward=...)`。
+详见 [docs/LEARN_05_TRAINING_MONITORING.md](docs/LEARN_05_TRAINING_MONITORING.md)。
+
 ### 2.2 流式（SSE）
 
 `POST /v1/chat/completions` 与 `POST /v1/completions` 支持 `"stream": true`：

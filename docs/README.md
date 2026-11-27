@@ -8,6 +8,7 @@
 | 02 | [LEARN_02_PREFIX_CACHE.md](LEARN_02_PREFIX_CACHE.md) | 块哈希链、引用计数/链感知 LRU、完全/部分命中、COW | `qwen3/prefix_cache.py`、`PagedKVcache.py`、`scheduler.py` |
 | 03 | [LEARN_03_SCHEDULING.md](LEARN_03_SCHEDULING.md) | 状态机、组批、chunked prefill、容量记账 | `qwen3/scheduler.py`、`request.py`、`batch.py` |
 | 04 | [LEARN_04_TESTING_BENCH.md](LEARN_04_TESTING_BENCH.md) | 四层测试、CI、TTFT/TPOT 口径、压测与长稳 | `tests/`、`bench_*.py`、`scripts/` |
+| 05 | [LEARN_05_TRAINING_MONITORING.md](LEARN_05_TRAINING_MONITORING.md) | 训推同机监控：快照接口、JSONL、GRPO 集成 | `qwen3/monitoring.py`、`integrations/` |
 
 每篇的结构：**概念 → 代码逐段 → 为什么这样设计 → 踩过的坑 → 动手实验 → 自测问题**。
 
